@@ -1,12 +1,15 @@
 /* Resume Tailor - event bus + webhook dispatcher
  *
- * Loaded before the app bundle. Exposes window.RTEmit(type, context), which the
- * bundle calls at four points:
+ * Loaded before the app bundle. Exposes:
  *
- *   profile.updated   - profile autosaved (debounced + deduped)
- *   resume.generated  - a tailored PDF was produced
- *   profile.exported  - details written to a JSON file
- *   profile.imported  - details loaded back from a JSON file
+ *   window.RTEmit(type, context)   - called by the bundle at four points:
+ *       profile.updated   - profile autosaved (debounced + deduped)
+ *       resume.generated  - a tailored PDF was produced
+ *       profile.exported  - details written to a JSON file
+ *       profile.imported  - details loaded back from a JSON file
+ *
+ *   window.RTWebhookOptions()      - [{ id, label }] for the Profile tab
+ *                                    dropdown, built from webhook.config.js
  *
  * Every event does three things:
  *   1. logs to the console
@@ -14,17 +17,17 @@
  *      browser extension) can listen without touching the bundle:
  *        document.addEventListener('resume-tailor:event', e => ...)        // all
  *        document.addEventListener('resume-tailor:resume.generated', ...)  // one
- *   3. POSTs to the webhook URL, IF one is set and valid
+ *   3. POSTs to the selected endpoint, IF one is selected and valid
  *
- * The webhook URL comes from the Profile tab ("Integrations" > Webhook URL) and
- * is stored in the profile like any other field. It is entirely OPTIONAL: when
- * blank or malformed, nothing is sent and nothing throws - events still log and
- * bubble as normal.
+ * The endpoint is chosen in Profile > Integrations > Webhook and stored in the
+ * profile as `webhookId`. Selection is entirely OPTIONAL: with "None" chosen,
+ * an id that no longer exists in the config, or a malformed URL, nothing is
+ * sent and nothing throws - events still log and bubble as normal.
  *
  * PRIVACY: the caller hands us raw app state, but only redact() output ever
  * leaves the page. It emits counts, booleans and the target company name -
- * never contact details, summary prose, bullet text, skill names, or the
- * webhook URL itself.
+ * never contact details, summary prose, bullet text, skill names, or endpoint
+ * URLs.
  */
 (function () {
   'use strict';
@@ -57,38 +60,71 @@
     try { console.warn(LOG_PREFIX, msg, extra === undefined ? '' : extra); } catch (e) { /* ignore */ }
   }
 
-  /* The URL lives in the profile (Profile tab > Integrations). The config file
-     may supply a fallback for deployments that want one baked in. */
-  function rawUrl() {
-    try {
-      var stored = localStorage.getItem(PROFILE_KEY);
-      if (stored) {
-        var p = JSON.parse(stored);
-        if (p && typeof p.webhookUrl === 'string' && p.webhookUrl.trim()) return p.webhookUrl.trim();
-      }
-    } catch (e) { /* unreadable/corrupt profile - fall through to config */ }
-    var c = cfg();
-    if (c && typeof c.url === 'string' && c.url.trim()) return c.url.trim();
-    return '';
-  }
-
   function isValidUrl(u) {
     if (typeof u !== 'string' || !u) return false;
     if (!/^https?:\/\//i.test(u)) return false;
     try { new URL(u); return true; } catch (e) { return false; }
   }
 
-  /* Returns a usable URL, or '' when the field is blank (the normal, expected
-     case) or malformed (warned about once, never thrown). */
-  function endpoint() {
-    if (!cfg()) return '';
-    var u = rawUrl();
-    if (!u) return '';                                  // optional field, left blank
-    if (!isValidUrl(u)) {
-      warnOnce('bad-url', 'Webhook URL is not a valid http(s) URL, so no events are being sent:', u);
-      return '';
+  /* Sanitised endpoint list. Bad entries (missing id, bad URL, duplicate id)
+     are skipped with a one-time warning rather than breaking the dropdown. */
+  function endpoints() {
+    var c = cfg();
+    var list = c && Array.isArray(c.endpoints) ? c.endpoints : [];
+    var out = [], seen = {};
+    for (var i = 0; i < list.length; i++) {
+      var ep = list[i];
+      if (!ep || typeof ep !== 'object') continue;
+      var id = typeof ep.id === 'string' ? ep.id.trim() : '';
+      var url = typeof ep.url === 'string' ? ep.url.trim() : '';
+      if (!id) { warnOnce('ep-noid-' + i, 'webhook.config.js endpoint #' + (i + 1) + ' has no id; skipped'); continue; }
+      if (seen[id]) { warnOnce('ep-dup-' + id, 'webhook.config.js has a duplicate endpoint id; later entry skipped:', id); continue; }
+      if (!isValidUrl(url)) { warnOnce('ep-url-' + id, 'webhook.config.js endpoint has an invalid url; skipped:', id); continue; }
+      seen[id] = true;
+      out.push({
+        id: id,
+        label: typeof ep.label === 'string' && ep.label.trim() ? ep.label.trim() : id,
+        url: url,
+        mode: ep.mode === 'no-cors' || ep.mode === 'cors' ? ep.mode : null,
+        headers: ep.headers && typeof ep.headers === 'object' ? ep.headers : null
+      });
     }
-    return u;
+    return out;
+  }
+
+  /* The id stored in the profile, or the config default when none is chosen. */
+  function selectedId() {
+    try {
+      var stored = localStorage.getItem(PROFILE_KEY);
+      if (stored) {
+        var p = JSON.parse(stored);
+        if (p && typeof p.webhookId === 'string' && p.webhookId.trim()) return p.webhookId.trim();
+      }
+    } catch (e) { /* unreadable/corrupt profile - fall through to default */ }
+    var c = cfg();
+    return c && typeof c.defaultEndpointId === 'string' ? c.defaultEndpointId.trim() : '';
+  }
+
+  /* Returns { id, url, mode, headers } for the selected endpoint, or null when
+     none is selected (the normal case) or the selection cannot be used. */
+  function resolve() {
+    var c = cfg();
+    if (!c) return null;
+    var id = selectedId();
+    if (!id) return null;                               // "None" - optional
+    var list = endpoints();
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].id === id) {
+        var ep = list[i];
+        var headers = {};
+        [c.headers, ep.headers].forEach(function (h) {
+          if (h && typeof h === 'object') Object.keys(h).forEach(function (k) { headers[k] = h[k]; });
+        });
+        return { id: ep.id, url: ep.url, mode: ep.mode || (c.mode === 'no-cors' ? 'no-cors' : 'cors'), headers: headers };
+      }
+    }
+    warnOnce('missing-' + id, 'selected webhook is not in webhook.config.js, so no events are being sent:', id);
+    return null;
   }
 
   function wants(type) {
@@ -153,8 +189,8 @@
       fieldsTotal: names.length,
       completeness: names.length ? Math.round((filled / names.length) * 100) : 0,
       roleBasedJobTitle: !!p.roleBasedJobTitle,
-      // whether an endpoint is configured - never the URL itself
-      webhookConfigured: has(p.webhookUrl),
+      // whether a webhook is selected - never which one or where it points
+      webhookConfigured: has(p.webhookId),
       counts: {
         workExperiences: work.length,
         workExperiencesFilled: work.filter(function (e) { return has(e && e.company); }).length,
@@ -228,25 +264,21 @@
 
   /* -------------------------------------------------------- transport --- */
 
-  function post(env, url) {
-    var c = cfg();
-    if (!c || !url) return Promise.resolve('skip');
+  function post(env, ep) {
+    if (!ep || !ep.url) return Promise.resolve('skip');
 
     var opts = { method: 'POST', body: JSON.stringify(env), keepalive: true };
-    if (c.mode === 'no-cors') {
+    if (ep.mode === 'no-cors') {
       opts.mode = 'no-cors';
       // no-cors permits only simple headers; application/json would be blocked
       opts.headers = { 'Content-Type': 'text/plain;charset=UTF-8' };
     } else {
       opts.headers = { 'Content-Type': 'application/json' };
-      var extra = c.headers;
-      if (extra && typeof extra === 'object') {
-        Object.keys(extra).forEach(function (k) { opts.headers[k] = extra[k]; });
-      }
+      Object.keys(ep.headers || {}).forEach(function (k) { opts.headers[k] = ep.headers[k]; });
     }
 
     try {
-      return fetch(url, opts).then(function (res) {
+      return fetch(ep.url, opts).then(function (res) {
         if (opts.mode === 'no-cors') return 'ok';        // opaque response, assume sent
         if (res.ok) return 'ok';
         // client errors (bad URL, auth, malformed) will not fix themselves
@@ -261,19 +293,19 @@
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
 
   function deliver(env) {
-    var url = endpoint();
-    if (!url) return Promise.resolve(true);              // nothing to do, not a failure
+    var ep = resolve();
+    if (!ep) return Promise.resolve(true);               // nothing to do, not a failure
     var c = cfg() || {};
     var retry = c.retry || {};
     var attempts = Math.max(1, num(retry.attempts) || 3);
     var backoff = Math.max(0, num(retry.backoffMs) || 800);
 
     function attempt(i) {
-      return post(env, url).then(function (result) {
-        if (result === 'ok') { log(LOG_PREFIX, 'delivered', env.type, '->', url); return true; }
+      return post(env, ep).then(function (result) {
+        if (result === 'ok') { log(LOG_PREFIX, 'delivered', env.type, '->', ep.id); return true; }
         if (result === 'skip') return true;
         if (result === 'drop') {
-          warnOnce('drop-' + env.type, 'webhook rejected the event (client error); not retrying:', url);
+          warnOnce('drop-' + ep.id + '-' + env.type, 'webhook rejected the event (client error); not retrying:', ep.id);
           return true;                                   // permanent; do not queue
         }
         if (i + 1 >= attempts) return false;
@@ -294,7 +326,7 @@
 
   var flushing = false;
   function flush() {
-    if (flushing || !endpoint()) return Promise.resolve();
+    if (flushing || !resolve()) return Promise.resolve();
     var q = readJSON(QUEUE_KEY, []);
     if (!Array.isArray(q) || !q.length) return Promise.resolve();
     flushing = true;
@@ -342,12 +374,12 @@
 
   function dispatch(type, ctx) {
     var env = envelope(type, redact(type, ctx));
-    var url = endpoint();
+    var ep = resolve();
 
-    log(LOG_PREFIX, type, env.data, url ? '(sending)' : '(no webhook URL - log only)');
+    log(LOG_PREFIX, type, env.data, ep ? '(sending to ' + ep.id + ')' : '(no webhook selected - log only)');
     bubble(env);                                   // always fires, webhook or not
 
-    if (!url || !wants(type)) return;
+    if (!ep || !wants(type)) return;
     flush();
     deliver(env).then(function (ok) { if (!ok) enqueue(env); }).catch(function () { /* ignore */ });
   }
@@ -383,6 +415,13 @@
       // instrumentation must never surface to the user
       try { console.warn(LOG_PREFIX, 'event failed', type, e); } catch (e2) { /* ignore */ }
     }
+  };
+
+  // Dropdown items for the Profile tab. Never throws; worst case is [].
+  window.RTWebhookOptions = function () {
+    try {
+      return endpoints().map(function (ep) { return { id: ep.id, label: ep.label }; });
+    } catch (e) { return []; }
   };
 
   // retry anything stranded by a previous session
