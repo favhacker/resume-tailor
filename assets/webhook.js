@@ -19,6 +19,12 @@
  *        document.addEventListener('resume-tailor:resume.generated', ...)  // one
  *   3. POSTs to the selected endpoint, IF one is selected and valid
  *
+ * Endpoint types decide the wire format:
+ *   generic - the JSON envelope below, as-is
+ *   discord - a Discord "Execute Webhook" message: one embed per event,
+ *             mentions disabled, sized to Discord's embed limits, sent with
+ *             ?wait=true so failures are reported instead of silently dropped
+ *
  * The endpoint is chosen in Profile > Integrations > Webhook and stored in the
  * profile as `webhookId`. Selection is entirely OPTIONAL: with "None" chosen,
  * an id that no longer exists in the config, or a malformed URL, nothing is
@@ -27,7 +33,7 @@
  * PRIVACY: the caller hands us raw app state, but only redact() output ever
  * leaves the page. It emits counts, booleans and the target company name -
  * never contact details, summary prose, bullet text, skill names, or endpoint
- * URLs.
+ * URLs. The Discord formatter only re-presents that same redacted data.
  */
 (function () {
   'use strict';
@@ -38,6 +44,11 @@
   var QUEUE_KEY = 'resume-tailor:webhook-queue';
   var MAX_QUEUE = 50;
   var LOG_PREFIX = '[resume-tailor]';
+  var TYPES = { generic: true, discord: true };
+
+  /* https://discord.com/api/webhooks/{webhook.id}/{webhook.token}
+     (also discordapp.com, canary./ptb. hosts, and an optional /v{n} API version) */
+  var DISCORD_URL = /^https:\/\/(?:(?:canary|ptb)\.)?discord(?:app)?\.com\/api(?:\/v\d+)?\/webhooks\/\d+\/[\w-]+\/?(?:\?.*)?$/i;
 
   /* ----------------------------------------------------------- config --- */
 
@@ -66,8 +77,10 @@
     try { new URL(u); return true; } catch (e) { return false; }
   }
 
-  /* Sanitised endpoint list. Bad entries (missing id, bad URL, duplicate id)
-     are skipped with a one-time warning rather than breaking the dropdown. */
+  function str(v) { return typeof v === 'string' ? v.trim() : ''; }
+
+  /* Sanitised endpoint list. Bad entries are skipped with a one-time warning
+     rather than breaking the dropdown. */
   function endpoints() {
     var c = cfg();
     var list = c && Array.isArray(c.endpoints) ? c.endpoints : [];
@@ -75,21 +88,71 @@
     for (var i = 0; i < list.length; i++) {
       var ep = list[i];
       if (!ep || typeof ep !== 'object') continue;
-      var id = typeof ep.id === 'string' ? ep.id.trim() : '';
-      var url = typeof ep.url === 'string' ? ep.url.trim() : '';
-      if (!id) { warnOnce('ep-noid-' + i, 'webhook.config.js endpoint #' + (i + 1) + ' has no id; skipped'); continue; }
-      if (seen[id]) { warnOnce('ep-dup-' + id, 'webhook.config.js has a duplicate endpoint id; later entry skipped:', id); continue; }
-      if (!isValidUrl(url)) { warnOnce('ep-url-' + id, 'webhook.config.js endpoint has an invalid url; skipped:', id); continue; }
-      seen[id] = true;
-      out.push({
+      var id = str(ep.id), url = str(ep.url), where = 'webhook.config.js endpoint "' + (id || '#' + (i + 1)) + '"';
+      if (!id) { warnOnce('ep-noid-' + i, where + ' has no id; skipped'); continue; }
+      if (seen[id]) { warnOnce('ep-dup-' + id, where + ' duplicates an earlier id; skipped'); continue; }
+      if (!isValidUrl(url)) { warnOnce('ep-url-' + id, where + ' has an invalid url; skipped'); continue; }
+
+      var type = str(ep.type).toLowerCase();
+      if (!type) {
+        // generic JSON would always be rejected by Discord, so infer it
+        type = DISCORD_URL.test(url) ? 'discord' : 'generic';
+        if (type === 'discord') warnOnce('ep-infer-' + id, where + ' has no type but is a Discord webhook url; treating it as type "discord"');
+      }
+      if (!TYPES[type]) { warnOnce('ep-type-' + id, where + ' has unknown type "' + type + '" (expected generic or discord); skipped'); continue; }
+
+      var norm = {
         id: id,
-        label: typeof ep.label === 'string' && ep.label.trim() ? ep.label.trim() : id,
+        label: str(ep.label) || id,
+        type: type,
         url: url,
         mode: ep.mode === 'no-cors' || ep.mode === 'cors' ? ep.mode : null,
         headers: ep.headers && typeof ep.headers === 'object' ? ep.headers : null
-      });
+      };
+
+      if (type === 'discord') {
+        if (!DISCORD_URL.test(url)) {
+          warnOnce('ep-dcurl-' + id, where + ' is type "discord" but the url is not https://discord.com/api/webhooks/{id}/{token}; skipped');
+          continue;
+        }
+        if (norm.mode === 'no-cors') {
+          // no-cors cannot send application/json, which Discord requires
+          warnOnce('ep-dcmode-' + id, where + ': mode "no-cors" is not usable with Discord; using "cors"');
+        }
+        norm.mode = 'cors';
+        norm.discord = discordOptions(ep, where, id);
+      }
+
+      seen[id] = true;
+      out.push(norm);
     }
     return out;
+  }
+
+  /* Optional Discord message overrides, validated against Discord's rules so a
+     bad value is dropped with a warning instead of making every send fail. */
+  function discordOptions(ep, where, id) {
+    var o = {};
+    var username = str(ep.username);
+    if (username) {
+      // webhook names are 1-80 chars and may not contain "clyde" or "discord"
+      if (username.length > 80 || /clyde|discord/i.test(username)) {
+        warnOnce('dc-user-' + id, where + ': username must be 1-80 chars and not contain "clyde" or "discord"; ignored');
+      } else { o.username = username; }
+    }
+    var avatar = str(ep.avatarUrl);
+    if (avatar) {
+      if (/^https?:\/\//i.test(avatar)) o.avatar_url = avatar;
+      else warnOnce('dc-avatar-' + id, where + ': avatarUrl must be an http(s) url; ignored');
+    }
+    var threadId = str(ep.threadId);
+    if (threadId) {
+      if (/^\d+$/.test(threadId)) o.threadId = threadId;
+      else warnOnce('dc-thread-' + id, where + ': threadId must be a numeric snowflake; ignored');
+    }
+    var threadName = str(ep.threadName);
+    if (threadName) o.thread_name = threadName.slice(0, 100);
+    return o;
   }
 
   /* The id stored in the profile, or the config default when none is chosen. */
@@ -105,8 +168,8 @@
     return c && typeof c.defaultEndpointId === 'string' ? c.defaultEndpointId.trim() : '';
   }
 
-  /* Returns { id, url, mode, headers } for the selected endpoint, or null when
-     none is selected (the normal case) or the selection cannot be used. */
+  /* The selected endpoint with effective mode/headers, or null when none is
+     selected (the normal case) or the selection cannot be used. */
   function resolve() {
     var c = cfg();
     if (!c) return null;
@@ -114,16 +177,18 @@
     if (!id) return null;                               // "None" - optional
     var list = endpoints();
     for (var i = 0; i < list.length; i++) {
-      if (list[i].id === id) {
-        var ep = list[i];
-        var headers = {};
-        [c.headers, ep.headers].forEach(function (h) {
-          if (h && typeof h === 'object') Object.keys(h).forEach(function (k) { headers[k] = h[k]; });
-        });
-        return { id: ep.id, url: ep.url, mode: ep.mode || (c.mode === 'no-cors' ? 'no-cors' : 'cors'), headers: headers };
-      }
+      if (list[i].id !== id) continue;
+      var ep = list[i], headers = {};
+      [c.headers, ep.headers].forEach(function (h) {
+        if (h && typeof h === 'object') Object.keys(h).forEach(function (k) { headers[k] = h[k]; });
+      });
+      return {
+        id: ep.id, type: ep.type, url: ep.url, discord: ep.discord || null,
+        mode: ep.mode || (c.mode === 'no-cors' ? 'no-cors' : 'cors'),
+        headers: headers
+      };
     }
-    warnOnce('missing-' + id, 'selected webhook is not in webhook.config.js, so no events are being sent:', id);
+    warnOnce('missing-' + id, 'selected webhook is not in webhook.config.js (or was skipped as invalid), so no events are being sent:', id);
     return null;
   }
 
@@ -262,13 +327,143 @@
     return data;
   }
 
+  /* --------------------------------------------------- discord format --- */
+  /* Discord embed limits: title 256, description 4096, 25 fields, field name
+     256, field value 1024, footer 2048, 6000 characters across the embed.     */
+
+  var DC = {
+    'resume.generated': { title: 'Resume generated', color: 0x57F287 },
+    'profile.updated': { title: 'Profile updated', color: 0x5865F2 },
+    'profile.exported': { title: 'Profile exported', color: 0xFEE75C },
+    'profile.imported': { title: 'Profile imported', color: 0xEB459E }
+  };
+  var SOURCES = { 'preview-download': 'Preview download', 'auto-paste': 'Auto-download on paste' };
+  var METHODS = { 'file-picker': 'Save dialog', download: 'Browser download' };
+
+  function clip(s, n) {
+    s = String(s == null ? '' : s);
+    return s.length > n ? s.slice(0, n - 1) + '\u2026' : s;
+  }
+
+  /* The company name comes from LLM output, so it is untrusted text: strip
+     control characters, escape markdown, and break @mentions (allowed_mentions
+     below also stops them pinging). */
+  function safeText(s, n) {
+    var t = String(s == null ? '' : s)
+      .replace(/[\u0000-\u001f\u007f\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]/g, ' ')
+      .replace(/\s+/g, ' ').trim();
+    t = clip(t, n)
+      .replace(/([\\*_~`|>#\[\]()])/g, '\\$1')
+      .replace(/@/g, '@\u200b');
+    return t;
+  }
+
+  function yesNo(b) { return b ? 'Yes' : 'No'; }
+  function field(name, value, inline) {
+    var v = String(value == null || value === '' ? 'n/a' : value);
+    return { name: clip(name, 256), value: clip(v, 1024), inline: inline !== false };
+  }
+
+  function profileFields(p) {
+    if (!p) return [field('Profile', 'unavailable', false)];
+    var c = p.counts || {};
+    return [
+      field('Completeness', p.completeness + '% (' + p.fieldsFilled + '/' + p.fieldsTotal + ' fields)'),
+      field('Work experience', c.workExperiencesFilled + ' of ' + c.workExperiences + ' filled'),
+      field('Requested bullets', c.requestedBulletPoints),
+      field('Education', c.educationsFilled + ' of ' + c.educations + ' filled'),
+      field('Certifications', c.certificationsFilled + ' of ' + c.certifications + ' filled'),
+      field('Role-based title', yesNo(p.roleBasedJobTitle))
+    ];
+  }
+
+  function discordBody(env, ep) {
+    var d = env.data || {};
+    var meta = DC[env.type] || { title: clip(String(env.type), 200), color: 0x99AAB5 };
+    var embed = { title: meta.title, color: meta.color, fields: [] };
+
+    switch (env.type) {
+      case 'resume.generated': {
+        embed.description = 'Target company: ' + (has(d.company) ? '**' + safeText(d.company, 200) + '**' : '_not specified_');
+        var r = d.resume || {}, s = d.settings || {};
+        embed.fields.push(
+          field('Source', SOURCES[d.source] || d.source),
+          field('Experience entries', r.experienceCount),
+          field('Bullet points', r.bulletCount),
+          field('Skills', r.skillCount != null ? r.skillCount + ' in ' + r.skillCategoryCount + ' categories' : null),
+          field('Bold keywords', r.boldSpans),
+          field('Summary', r.hasSummary ? 'Yes (' + r.summaryLength + ' chars)' : 'No'),
+          field('Education', r.educationCount),
+          field('Certifications', r.certificationCount),
+          field('Layout', s.fontFamily ? s.fontFamily + ' ' + (s.fontSize || '?') + 'pt, ' + (s.experienceLayout || 'default') : null)
+        );
+        break;
+      }
+      case 'profile.updated':
+        embed.fields = profileFields(d.profile);
+        break;
+      case 'profile.exported':
+      case 'profile.imported':
+        embed.fields = [field('Method', METHODS[d.method] || d.method || 'File upload')]
+          .concat(profileFields(d.profile))
+          .concat([field('Includes JSON response', yesNo(d.hasJsonResponse))]);
+        break;
+      default:
+        embed.description = 'Unrecognised event.';
+    }
+
+    embed.fields = embed.fields.slice(0, 25);
+    embed.footer = { text: clip(env.source + ' \u2022 session ' + String(env.sessionId).slice(0, 8), 2048) };
+    if (env.occurredAt) embed.timestamp = env.occurredAt;
+
+    // stay inside the 6000-character total by shedding fields from the end
+    function size(e) {
+      return (e.title || '').length + (e.description || '').length + e.footer.text.length +
+        e.fields.reduce(function (n, f) { return n + f.name.length + f.value.length; }, 0);
+    }
+    while (size(embed) > 6000 && embed.fields.length) embed.fields.pop();
+
+    var body = {
+      embeds: [embed],
+      allowed_mentions: { parse: [] }              // never ping anyone
+    };
+    var o = ep.discord || {};
+    if (o.username) body.username = o.username;
+    if (o.avatar_url) body.avatar_url = o.avatar_url;
+    if (o.thread_name) body.thread_name = o.thread_name;
+    return body;
+  }
+
+  function discordUrl(ep) {
+    try {
+      var u = new URL(ep.url);
+      u.searchParams.set('wait', 'true');          // report failures instead of silently dropping
+      if (ep.discord && ep.discord.threadId) u.searchParams.set('thread_id', ep.discord.threadId);
+      return u.toString();
+    } catch (e) { return ep.url; }
+  }
+
   /* -------------------------------------------------------- transport --- */
 
-  function post(env, ep) {
-    if (!ep || !ep.url) return Promise.resolve('skip');
+  function request(env, ep) {
+    if (ep.type === 'discord') {
+      return { url: discordUrl(ep), body: JSON.stringify(discordBody(env, ep)), mode: 'cors' };
+    }
+    return { url: ep.url, body: JSON.stringify(env), mode: ep.mode };
+  }
 
-    var opts = { method: 'POST', body: JSON.stringify(env), keepalive: true };
-    if (ep.mode === 'no-cors') {
+  /* Resolves to { result: 'ok'|'retry'|'drop'|'skip', wait?: ms } */
+  function post(env, ep) {
+    if (!ep || !ep.url) return Promise.resolve({ result: 'skip' });
+
+    var req;
+    try { req = request(env, ep); } catch (e) {
+      warnOnce('fmt-' + ep.id, 'could not build the request for ' + ep.id + '; event dropped', e);
+      return Promise.resolve({ result: 'drop' });
+    }
+
+    var opts = { method: 'POST', body: req.body, keepalive: true };
+    if (req.mode === 'no-cors') {
       opts.mode = 'no-cors';
       // no-cors permits only simple headers; application/json would be blocked
       opts.headers = { 'Content-Type': 'text/plain;charset=UTF-8' };
@@ -278,16 +473,43 @@
     }
 
     try {
-      return fetch(ep.url, opts).then(function (res) {
-        if (opts.mode === 'no-cors') return 'ok';        // opaque response, assume sent
-        if (res.ok) return 'ok';
-        // client errors (bad URL, auth, malformed) will not fix themselves
-        if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) return 'drop';
-        return 'retry';
-      }).catch(function () { return 'retry'; });
+      return fetch(req.url, opts).then(function (res) {
+        if (opts.mode === 'no-cors') return { result: 'ok' };   // opaque response, assume sent
+        if (res.ok) return { result: 'ok' };
+        if (res.status === 429) return retryAfter(res).then(function (ms) { return { result: 'retry', wait: ms }; });
+        // other client errors (bad token, deleted webhook, malformed body) will not fix themselves
+        if (res.status >= 400 && res.status < 500 && res.status !== 408) {
+          return describe(res).then(function (why) {
+            warnOnce('drop-' + ep.id + '-' + res.status, 'webhook ' + ep.id + ' rejected the event (HTTP ' + res.status + '); not retrying', why);
+            return { result: 'drop' };
+          });
+        }
+        return { result: 'retry' };
+      }).catch(function () { return { result: 'retry' }; });
     } catch (e) {
-      return Promise.resolve('retry');                   // fetch missing/blocked
+      return Promise.resolve({ result: 'retry' });              // fetch missing/blocked
     }
+  }
+
+  /* Rate limits: Discord sends retry_after (seconds) in the body and a
+     Retry-After header. Capped so a bad value cannot stall the queue. */
+  function retryAfter(res) {
+    var header = 0;
+    try { header = parseFloat(res.headers && res.headers.get && res.headers.get('Retry-After')) || 0; } catch (e) { /* ignore */ }
+    var body = res.json ? res.json().catch(function () { return null; }) : Promise.resolve(null);
+    return body.then(function (j) {
+      var secs = j && typeof j.retry_after === 'number' ? j.retry_after : header;
+      return Math.min(Math.max(0, secs * 1000), 60000);
+    }).catch(function () { return 0; });
+  }
+
+  function describe(res) {
+    try {
+      if (!res.json) return Promise.resolve('');
+      return res.json().then(function (j) {
+        return j && (j.message || j.code) ? (j.code ? j.code + ' ' : '') + (j.message || '') : '';
+      }).catch(function () { return ''; });
+    } catch (e) { return Promise.resolve(''); }
   }
 
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
@@ -301,15 +523,13 @@
     var backoff = Math.max(0, num(retry.backoffMs) || 800);
 
     function attempt(i) {
-      return post(env, ep).then(function (result) {
-        if (result === 'ok') { log(LOG_PREFIX, 'delivered', env.type, '->', ep.id); return true; }
-        if (result === 'skip') return true;
-        if (result === 'drop') {
-          warnOnce('drop-' + ep.id + '-' + env.type, 'webhook rejected the event (client error); not retrying:', ep.id);
-          return true;                                   // permanent; do not queue
-        }
+      return post(env, ep).then(function (out) {
+        if (out.result === 'ok') { log(LOG_PREFIX, 'delivered', env.type, '->', ep.id + ' (' + ep.type + ')'); return true; }
+        if (out.result === 'skip' || out.result === 'drop') return true;   // permanent; do not queue
         if (i + 1 >= attempts) return false;
-        return sleep(backoff * Math.pow(2, i)).then(function () { return attempt(i + 1); });
+        var wait = out.wait != null ? out.wait : backoff * Math.pow(2, i);
+        if (out.wait != null) log(LOG_PREFIX, 'rate limited by', ep.id + ', retrying in', Math.round(wait) + 'ms');
+        return sleep(wait).then(function () { return attempt(i + 1); });
       }).catch(function () { return false; });
     }
     return attempt(0);
@@ -376,7 +596,7 @@
     var env = envelope(type, redact(type, ctx));
     var ep = resolve();
 
-    log(LOG_PREFIX, type, env.data, ep ? '(sending to ' + ep.id + ')' : '(no webhook selected - log only)');
+    log(LOG_PREFIX, type, env.data, ep ? '(sending to ' + ep.id + ' as ' + ep.type + ')' : '(no webhook selected - log only)');
     bubble(env);                                   // always fires, webhook or not
 
     if (!ep || !wants(type)) return;
