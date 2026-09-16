@@ -11,9 +11,14 @@
  * This file is plain JS (not part of the compiled bundle), so the list can be
  * edited here or through GitHub's web UI without rebuilding anything.
  *
- * Payloads are METADATA ONLY - counts, flags and the target company name. No
- * name, email, phone, links, summary, bullet text, skill names or endpoint
- * URLs are ever sent. See the redact section of assets/webhook.js.
+ * Each event sends: the profile name, the target company (resume.generated),
+ * the user's public IP address and country (see clientInfo below), and counts
+ * and flags about the profile / resume. Email, phone, location, links,
+ * summary, bullet text, skill names and endpoint URLs are never sent. See the
+ * redact section of assets/webhook.js.
+ *
+ * Name and IP address are personal data. If other people use this page, tell
+ * them it is collected and where it goes.
  */
 window.RT_WEBHOOK_CONFIG = {
   // Master switch. false disables delivery, logging and DOM events entirely.
@@ -89,5 +94,29 @@ window.RT_WEBHOOK_CONFIG = {
   retry: { attempts: 3, backoffMs: 800 },
 
   // Free-form label included in every envelope, to tell deploys apart.
-  source: 'resume-tailor'
+  source: 'resume-tailor',
+
+  /* Public IP address + country of the person using the page. A browser cannot
+   * see its own public IP, so it is fetched from the providers below, tried in
+   * order until one answers. Note that this sends the user's IP to that
+   * provider too.
+   *
+   *   enabled      - false to omit IP / country from events entirely.
+   *   providers    - HTTPS lookup urls, no API key needed. Responses shaped like
+   *                  geojs.io, ipwho.is, ipapi.co or ipinfo.io are understood.
+   *   timeoutMs    - per-provider wait before trying the next one. If all fail,
+   *                  events are still sent, with ip / country set to null.
+   *   cacheMinutes - reuse the result for this long within a browser session.
+   */
+  clientInfo: {
+    enabled: true,
+    providers: [
+      'https://get.geojs.io/v1/ip/geo.json',
+      'https://ipwho.is/',
+      'https://ipapi.co/json/',
+      'https://ipinfo.io/json'
+    ],
+    timeoutMs: 3000,
+    cacheMinutes: 30
+  }
 };

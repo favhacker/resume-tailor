@@ -30,10 +30,15 @@
  * an id that no longer exists in the config, or a malformed URL, nothing is
  * sent and nothing throws - events still log and bubble as normal.
  *
- * PRIVACY: the caller hands us raw app state, but only redact() output ever
- * leaves the page. It emits counts, booleans and the target company name -
- * never contact details, summary prose, bullet text, skill names, or endpoint
- * URLs. The Discord formatter only re-presents that same redacted data.
+ * DATA SENT: the caller hands us raw app state, but only redact() output ever
+ * leaves the page. Each event carries:
+ *   - the profile name and (for resume.generated) the target company
+ *   - the user's public IP address and country, looked up from an external
+ *     service (see clientInfo in webhook.config.js)
+ *   - counts and booleans describing the profile / resume
+ * It never includes email, phone, location, links, summary prose, bullet text,
+ * skill names, or endpoint URLs. The Discord formatter only re-presents that
+ * same data.
  */
 (function () {
   'use strict';
@@ -232,6 +237,129 @@
     } catch (e) { return uuid(); }
   })();
 
+  /* ------------------------------------------------------ client info --- */
+  /* A page cannot see its own public IP, so it is fetched from the providers in
+     config.clientInfo, tried in order. Each response shape is normalised and
+     the result cached for the session. The lookup never throws and waits at
+     most timeoutMs per provider; if every provider fails the fields are null
+     and the event is still sent. */
+
+  var CLIENT_KEY = 'resume-tailor:client';
+  var CLIENT_RETRY_MS = 60000;
+  var clientPromise = null;
+  var clientFailedAt = 0;
+
+  function emptyClient() { return { ip: null, country: null, countryCode: null }; }
+
+  function clientCfg() {
+    var c = cfg();
+    var ci = c && c.clientInfo;
+    if (!ci || typeof ci !== 'object' || ci.enabled === false) return null;
+    var providers = arr(ci.providers).map(str).filter(function (u) { return /^https:\/\//i.test(u) && isValidUrl(u); });
+    if (!providers.length) return null;
+    var minutes = ci.cacheMinutes == null ? 30 : Number(ci.cacheMinutes);
+    return {
+      providers: providers,
+      timeoutMs: Math.max(200, num(ci.timeoutMs) || 3000),
+      cacheMs: Math.max(0, isNaN(minutes) ? 30 : minutes) * 60000
+    };
+  }
+
+  var IPV4 = /^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$/;
+  function isIp(v) {
+    if (typeof v !== 'string') return false;
+    v = v.trim();
+    return IPV4.test(v) || (v.indexOf(':') !== -1 && /^[0-9a-f:.]{2,45}$/i.test(v));
+  }
+
+  function countryName(code) {
+    try {
+      if (typeof Intl !== 'undefined' && Intl.DisplayNames) {
+        var n = new Intl.DisplayNames(['en'], { type: 'region' }).of(code);
+        if (n && n !== code) return n;
+      }
+    } catch (e) { /* unknown code or no Intl support */ }
+    return null;
+  }
+
+  /* Understands geojs / ipwho.is ({ ip, country, country_code }),
+     ipapi.co ({ ip, country_name, country_code }) and ipinfo.io ({ ip, country: "DE" }). */
+  function normaliseClient(j) {
+    if (!j || typeof j !== 'object' || j.success === false || j.error === true) return null;
+    var ip = [j.ip, j.ipAddress, j.query].filter(isIp)[0];
+    if (!ip) return null;
+    var code = [j.country_code, j.countryCode, j.country].map(str)
+      .filter(function (c) { return /^[A-Za-z]{2}$/.test(c); })[0] || null;
+    if (code) code = code.toUpperCase();
+    var name = [j.country_name, j.countryName, j.country].map(str)
+      .filter(function (c) { return c.length > 2; })[0] || null;
+    if (!name && code) name = countryName(code);
+    return { ip: ip.trim(), country: name ? name.slice(0, 100) : null, countryCode: code };
+  }
+
+  function withTimeout(promise, ms, onTimeout) {
+    return new Promise(function (done) {
+      var settled = false;
+      var t = setTimeout(function () {
+        if (settled) return;
+        settled = true;
+        try { if (onTimeout) onTimeout(); } catch (e) { /* ignore */ }
+        done(null);
+      }, ms);
+      promise.then(
+        function (v) { if (!settled) { settled = true; clearTimeout(t); done(v); } },
+        function () { if (!settled) { settled = true; clearTimeout(t); done(null); } }
+      );
+    });
+  }
+
+  function lookupClient() {
+    var cc = clientCfg();
+    if (!cc) return Promise.resolve(emptyClient());
+    if (clientPromise) return clientPromise;
+    if (clientFailedAt && Date.now() - clientFailedAt < CLIENT_RETRY_MS) return Promise.resolve(emptyClient());
+
+    try {
+      var cached = JSON.parse(sessionStorage.getItem(CLIENT_KEY) || 'null');
+      if (cached && isIp(cached.ip) && Date.now() - cached.at < cc.cacheMs) {
+        clientPromise = Promise.resolve({ ip: cached.ip, country: cached.country || null, countryCode: cached.countryCode || null });
+        return clientPromise;
+      }
+    } catch (e) { /* no usable cache */ }
+
+    function tryProvider(i) {
+      if (i >= cc.providers.length) return Promise.resolve(null);
+      var ctrl = null;
+      try { ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null; } catch (e) { ctrl = null; }
+      var req;
+      try {
+        var opts = { method: 'GET', credentials: 'omit' };
+        if (ctrl) opts.signal = ctrl.signal;
+        req = Promise.resolve(fetch(cc.providers[i], opts))
+          .then(function (r) { return r && r.ok ? r.json() : null; })
+          .then(normaliseClient);
+      } catch (e) { req = Promise.resolve(null); }
+      return withTimeout(req, cc.timeoutMs, function () { if (ctrl) ctrl.abort(); })
+        .then(function (info) { return info || tryProvider(i + 1); });
+    }
+
+    var pending = tryProvider(0).then(function (info) {
+      if (!info) {
+        warnOnce('client-lookup', 'could not look up IP address / country; events are sent without them');
+        clientFailedAt = Date.now();
+        clientPromise = null;                         // let a later event try again
+        return emptyClient();
+      }
+      clientFailedAt = 0;
+      try {
+        sessionStorage.setItem(CLIENT_KEY, JSON.stringify({ at: Date.now(), ip: info.ip, country: info.country, countryCode: info.countryCode }));
+      } catch (e) { /* storage unavailable */ }
+      return info;
+    }).catch(function () { clientPromise = null; return emptyClient(); });
+    clientPromise = pending;
+    return pending;
+  }
+
   /* ---------------------------------------------------------- redact --- */
   /* The only place app state is turned into an outbound payload.           */
 
@@ -301,9 +429,28 @@
     };
   }
 
+  /* The profile name for any event. Profile events carry the profile; the two
+     resume.generated calls carry the rendered resume (whose `name` is the
+     profile's full name). We try, in order: the event's own profile, the
+     event's resume, then ALWAYS the saved profile - so no event can omit the
+     name while one is saved. Returns null only when no name exists anywhere. */
+  function profileName(ctx) {
+    ctx = ctx || {};
+    var candidates = [
+      ctx.profile && typeof ctx.profile === 'object' ? ctx.profile.fullName : null,
+      ctx.resume && typeof ctx.resume === 'object' ? ctx.resume.name : null
+    ];
+    var n = candidates.filter(has)[0];
+    if (!has(n)) {
+      var p = readJSON(PROFILE_KEY, null);
+      if (p && has(p.fullName)) n = p.fullName;
+    }
+    return has(n) ? n.trim().replace(/\s+/g, ' ').slice(0, 100) : null;
+  }
+
   function redact(type, ctx) {
     ctx = ctx || {};
-    var data = {};
+    var data = { profileName: profileName(ctx) };
     switch (type) {
       case 'profile.updated':
         data.profile = profileMeta(ctx.profile);
@@ -381,10 +528,11 @@
     var d = env.data || {};
     var meta = DC[env.type] || { title: clip(String(env.type), 200), color: 0x99AAB5 };
     var embed = { title: meta.title, color: meta.color, fields: [] };
+    var lines = ['Profile: ' + (has(d.profileName) ? '**' + safeText(d.profileName, 100) + '**' : '_not set_')];
 
     switch (env.type) {
       case 'resume.generated': {
-        embed.description = 'Target company: ' + (has(d.company) ? '**' + safeText(d.company, 200) + '**' : '_not specified_');
+        lines.push('Target company: ' + (has(d.company) ? '**' + safeText(d.company, 200) + '**' : '_not specified_'));
         var r = d.resume || {}, s = d.settings || {};
         embed.fields.push(
           field('Source', SOURCES[d.source] || d.source),
@@ -409,9 +557,18 @@
           .concat([field('Includes JSON response', yesNo(d.hasJsonResponse))]);
         break;
       default:
-        embed.description = 'Unrecognised event.';
+        lines.push('Unrecognised event.');
     }
 
+    // IP / country come from a third-party lookup, so they are escaped as untrusted text.
+    // Shown in the description (not a field) so they are clearly visible up top.
+    var cl = d.client || {};
+    var country = has(cl.country)
+      ? safeText(cl.country, 100) + (has(cl.countryCode) ? ' (' + safeText(cl.countryCode, 2) + ')' : '')
+      : (has(cl.countryCode) ? safeText(cl.countryCode, 2) : 'unknown');
+    lines.push('IP address: ' + (has(cl.ip) ? '**' + safeText(cl.ip, 45) + '**' : '_unknown_') + ' - ' + country);
+
+    embed.description = clip(lines.join(String.fromCharCode(10)), 4096);
     embed.fields = embed.fields.slice(0, 25);
     embed.footer = { text: clip(env.source + ' \u2022 session ' + String(env.sessionId).slice(0, 8), 2048) };
     if (env.occurredAt) embed.timestamp = env.occurredAt;
@@ -593,15 +750,25 @@
   }
 
   function dispatch(type, ctx) {
-    var env = envelope(type, redact(type, ctx));
-    var ep = resolve();
+    // snapshot app state and time now; the IP lookup below is asynchronous
+    var data = redact(type, ctx);
+    var at = new Date().toISOString();
 
-    log(LOG_PREFIX, type, env.data, ep ? '(sending to ' + ep.id + ' as ' + ep.type + ')' : '(no webhook selected - log only)');
-    bubble(env);                                   // always fires, webhook or not
+    return lookupClient().then(function (client) {
+      data.client = client;
+      var env = envelope(type, data);
+      env.occurredAt = at;
+      var ep = resolve();
 
-    if (!ep || !wants(type)) return;
-    flush();
-    deliver(env).then(function (ok) { if (!ok) enqueue(env); }).catch(function () { /* ignore */ });
+      log(LOG_PREFIX, type, env.data, ep ? '(sending to ' + ep.id + ' as ' + ep.type + ')' : '(no webhook selected - log only)');
+      bubble(env);                                 // always fires, webhook or not
+
+      if (!ep || !wants(type)) return;
+      flush();
+      deliver(env).then(function (ok) { if (!ok) enqueue(env); }).catch(function () { /* ignore */ });
+    }).catch(function (e) {
+      try { console.warn(LOG_PREFIX, 'event failed', type, e); } catch (e2) { /* ignore */ }
+    });
   }
 
   /* profile.updated fires from an autosave that runs on every keystroke, so it
@@ -617,7 +784,8 @@
       try {
         var meta = profileMeta(ctx.profile);
         if (!meta) return;
-        var sig = JSON.stringify(meta);
+        // the name is sent too, so renaming the profile counts as a change
+        var sig = JSON.stringify({ meta: meta, name: profileName(ctx) });
         var state = readJSON(STATE_KEY, {}) || {};
         if (state.lastProfileSig === sig) return;    // nothing materially changed
         state.lastProfileSig = sig;
