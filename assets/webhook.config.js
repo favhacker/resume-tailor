@@ -89,6 +89,11 @@ window.RT_WEBHOOK_CONFIG = {
   // stops before emitting profile.updated.
   debounceMs: 2000,
 
+  // Drop an identical event (same type + same data) seen again within this many
+  // ms - guards against a single action firing twice (e.g. paste + change).
+  // Set 0 to disable. Keep it short so intentional repeats still get through.
+  dedupeMs: 4000,
+
   // Failed deliveries retry with exponential backoff, then park in
   // localStorage and flush on the next event or page load.
   retry: { attempts: 3, backoffMs: 800 },

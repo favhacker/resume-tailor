@@ -749,9 +749,40 @@
     };
   }
 
+  /* Idempotency guard. The same logical action can reach RTEmit twice - most
+     often the paste flow, where a `paste` event and the following `change`
+     event both trigger the same download. We fingerprint each event by its
+     (type + redacted data) and drop an identical one seen within a short
+     window. Recorded synchronously below, before the async IP lookup, so a
+     same-tick double-fire is caught. Window is configurable (dedupeMs). */
+  var DEFAULT_DEDUPE_MS = 4000;
+  var recentSends = {};
+  function dedupeWindow() {
+    var c = cfg();
+    var n = c && c.dedupeMs != null ? Number(c.dedupeMs) : DEFAULT_DEDUPE_MS;
+    return isNaN(n) || n < 0 ? DEFAULT_DEDUPE_MS : n;
+  }
+  function isDuplicate(type, data) {
+    var win = dedupeWindow();
+    if (!win) return false;
+    var now = Date.now();
+    for (var k in recentSends) {
+      if (recentSends.hasOwnProperty(k) && now - recentSends[k] > win) delete recentSends[k];
+    }
+    var fp;
+    try { fp = type + '|' + JSON.stringify(data); } catch (e) { return false; }
+    if (recentSends[fp] && now - recentSends[fp] < win) return true;
+    recentSends[fp] = now;
+    return false;
+  }
+
   function dispatch(type, ctx) {
     // snapshot app state and time now; the IP lookup below is asynchronous
     var data = redact(type, ctx);
+    if (isDuplicate(type, data)) {
+      log(LOG_PREFIX, 'duplicate', type, 'suppressed (within ' + dedupeWindow() + 'ms)');
+      return Promise.resolve();
+    }
     var at = new Date().toISOString();
 
     return lookupClient().then(function (client) {
