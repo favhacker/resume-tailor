@@ -762,6 +762,17 @@
     var n = c && c.dedupeMs != null ? Number(c.dedupeMs) : DEFAULT_DEDUPE_MS;
     return isNaN(n) || n < 0 ? DEFAULT_DEDUPE_MS : n;
   }
+  /* The fingerprint identifies "the same event", ignoring incidental metadata.
+     resume.generated fires from two paths (auto-paste and the preview Download
+     button) that produce near-identical messages differing only by `source`;
+     keying on profile + company collapses those into one. Other events key on
+     their full data. */
+  function dedupeKey(type, data) {
+    if (type === 'resume.generated') {
+      return type + '|' + (data.profileName || '') + '|' + (data.company || '');
+    }
+    try { return type + '|' + JSON.stringify(data); } catch (e) { return null; }
+  }
   function isDuplicate(type, data) {
     var win = dedupeWindow();
     if (!win) return false;
@@ -769,8 +780,8 @@
     for (var k in recentSends) {
       if (recentSends.hasOwnProperty(k) && now - recentSends[k] > win) delete recentSends[k];
     }
-    var fp;
-    try { fp = type + '|' + JSON.stringify(data); } catch (e) { return false; }
+    var fp = dedupeKey(type, data);
+    if (fp == null) return false;
     if (recentSends[fp] && now - recentSends[fp] < win) return true;
     recentSends[fp] = now;
     return false;
