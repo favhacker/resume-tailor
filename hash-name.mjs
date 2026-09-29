@@ -49,7 +49,15 @@ if (names.length === 0) {
 }
 
 // Run the two browser scripts in a sandbox that looks enough like a window.
-const sandbox = { console: { log() {}, warn: console.warn } };
+// webhook.js is not loaded here, so access.js sees no endpoints and complains
+// that requireWebhook is unsatisfiable. That is true of this sandbox and not of
+// the page, and hashing does not care either way, so drop just that one.
+const sandbox = {
+  console: {
+    log() {},
+    warn: (...a) => { if (!String(a.join(' ')).includes('requireWebhook')) console.warn(...a); }
+  }
+};
 sandbox.window = sandbox;
 vm.createContext(sandbox);
 for (const file of [CONFIG, GUARD]) {
