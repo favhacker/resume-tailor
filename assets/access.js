@@ -1,8 +1,13 @@
 /* Resume Tailor - profile access guard
  *
  * Loaded before the app bundle, alongside webhook.js. Reads the rules in
- * access.config.js and answers one question: given the name currently typed
- * into the profile, which tabs should be hidden?
+ * access.config.js and answers one question: given the profile as it stands,
+ * which tabs should be hidden?
+ *
+ * Two things can hide a tab:
+ *   blocklist - the name matches an entry in access.config.js
+ *   webhook   - `requireWebhook` is on and Profile > Integrations > Webhook is
+ *               unset, or points at an id webhook.config.js no longer lists
  *
  * Exposes:
  *
@@ -10,9 +15,12 @@
  *                                          profile is saved (every autosave)
  *   window.RTAccess.blockedTabs()        - ['preview'] etc, or [] when allowed
  *   window.RTAccess.isBlockedTab(id)     - convenience for one tab id
+ *   window.RTAccess.reason()             - 'blocklist' | 'webhook' | null
+ *   window.RTAccess.requiresWebhook()    - is a webhook a precondition here?
+ *   window.RTAccess.hasWebhook()         - does the profile satisfy it?
  *   window.RTAccess.isBlocked(name)      - the raw name test, for any caller
  *   window.RTAccess.fallbackTab()        - tab to fall back to when kicked out
- *   window.RTAccess.message()            - text to show in a blocked tab
+ *   window.RTAccess.message(reason)      - text to show in a blocked tab
  *   window.RTAccess.hash(name)           - { hash, len } to paste into the
  *                                          config; see hash-name.mjs
  *
@@ -21,6 +29,7 @@
  *
  *   document.addEventListener('resume-tailor:access-changed', e => {
  *     e.detail.blockedTabs  // string[]
+ *     e.detail.reason       // 'blocklist' | 'webhook' | null
  *   });
  *
  * The profile name never leaves the page - this file makes no requests.
@@ -43,8 +52,9 @@
   var MAX_NAME = 120;     // longer input is truncated before hashing
   var MAX_CACHE = 512;
 
-  var currentName = '';
+  var currentProfile = { name: '', webhookId: '' };
   var currentTabs = [];
+  var currentReason = null;
   var warned = {};
 
   function warnOnce(key, msg, extra) {
@@ -251,6 +261,46 @@
     return false;
   }
 
+  /* --------------------------------------------------- webhook rule --- */
+  /* `requireWebhook` makes the Profile > Integrations > Webhook dropdown a
+     precondition: until it points at an endpoint that webhook.config.js still
+     lists, the profile is treated exactly like a blocked one. */
+
+  function webhookOptions() {
+    try {
+      var o = window.RTWebhookOptions && window.RTWebhookOptions();
+      return Array.isArray(o) ? o : [];
+    } catch (e) { return []; }
+  }
+
+  function requiresWebhook() {
+    var c = cfg();
+    if (!c || c.requireWebhook !== true) return false;
+    /* No endpoints to pick from means no profile could ever satisfy the rule,
+       which would lock everyone out of the app. Refuse to enforce it. */
+    if (webhookOptions().length === 0) {
+      warnOnce('rw-empty', 'access.config.js sets requireWebhook: true, but webhook.config.js offers no usable endpoint, so no profile could ever satisfy it. The requirement is ignored until at least one endpoint exists.');
+      return false;
+    }
+    return true;
+  }
+
+  function hasWebhook(id) {
+    id = str(id);
+    if (!id) return false;
+    var o = webhookOptions();
+    for (var i = 0; i < o.length; i++) if (o[i] && o[i].id === id) return true;
+    return false;   // selected, but no longer listed in webhook.config.js
+  }
+
+  /* 'blocklist', 'webhook', or null when the profile is fine. */
+  function reasonFor(p) {
+    if (!cfg()) return null;
+    if (isBlocked(p.name)) return 'blocklist';
+    if (requiresWebhook() && !hasWebhook(p.webhookId)) return 'webhook';
+    return null;
+  }
+
   /* --------------------------------------------------------- the tabs --- */
 
   function configuredTabs() {
@@ -272,13 +322,16 @@
     return TABS[id] ? id : 'home';
   }
 
-  function message() {
-    var c = cfg();
-    return str(c && c.message) || 'This profile does not have access to this tab.';
+  /* `reason` defaults to why the current profile is blocked. */
+  function message(reason) {
+    var c = cfg() || {};
+    var m = c.messages && typeof c.messages === 'object' ? c.messages : {};
+    var why = reason === undefined ? currentReason : reason;
+    return str(m[why]) || str(c.message) || 'This profile does not have access to this tab.';
   }
 
-  function tabsFor(name) {
-    return isBlocked(name) ? configuredTabs() : [];
+  function tabsFor(p) {
+    return reasonFor(p) ? configuredTabs() : [];
   }
 
   function same(a, b) {
@@ -290,19 +343,21 @@
   /* Recompute from `currentName`; announce only when the answer moved. The name
      is deliberately kept out of the log line and the event detail. */
   function refresh() {
-    var next = tabsFor(currentName);
-    if (same(next, currentTabs)) return currentTabs;
+    var why = reasonFor(currentProfile);
+    var next = why ? configuredTabs() : [];
+    if (same(next, currentTabs) && why === currentReason) return currentTabs;
 
     var was = currentTabs;
     currentTabs = next;
+    currentReason = why;
 
-    if (next.length) log(LOG_PREFIX, 'this profile is blocked from: ' + next.join(', '));
+    if (next.length) log(LOG_PREFIX, 'this profile is blocked from: ' + next.join(', ') + ' (' + why + ')');
     else if (was.length) log(LOG_PREFIX, 'this profile is no longer blocked');
 
     try {
       document.documentElement.dispatchEvent(new CustomEvent(EVENT, {
         bubbles: true,
-        detail: { blockedTabs: next.slice() }
+        detail: { blockedTabs: next.slice(), reason: why }
       }));
     } catch (e) { /* very old browser - the app still reads blockedTabs() on mount */ }
 
@@ -310,7 +365,9 @@
   }
 
   function setProfile(profile) {
-    currentName = profile && typeof profile === 'object' ? str(profile.fullName) : str(profile);
+    currentProfile = profile && typeof profile === 'object'
+      ? { name: str(profile.fullName), webhookId: str(profile.webhookId) }
+      : { name: str(profile), webhookId: '' };
     return refresh();
   }
 
@@ -319,10 +376,14 @@
   function boot() {
     try {
       var raw = localStorage.getItem(PROFILE_KEY);
-      if (raw) currentName = str(JSON.parse(raw).fullName);
+      if (raw) {
+        var saved = JSON.parse(raw);
+        currentProfile = { name: str(saved.fullName), webhookId: str(saved.webhookId) };
+      }
     } catch (e) { /* no storage, or not JSON - treat as no profile */ }
-    currentTabs = tabsFor(currentName);
-    if (currentTabs.length) log(LOG_PREFIX, 'this profile is blocked from: ' + currentTabs.join(', '));
+    currentReason = reasonFor(currentProfile);
+    currentTabs = currentReason ? configuredTabs() : [];
+    if (currentTabs.length) log(LOG_PREFIX, 'this profile is blocked from: ' + currentTabs.join(', ') + ' (' + currentReason + ')');
   }
 
   boot();
@@ -336,6 +397,13 @@
     message: message,
     refresh: refresh,
     event: EVENT,
+    /* Why the current profile is blocked: 'blocklist', 'webhook' or null. */
+    reason: function () { return currentReason; },
+    /* Is a webhook currently a precondition for generating? False when the rule
+       is off, or when webhook.config.js lists nothing to pick. */
+    requiresWebhook: requiresWebhook,
+    /* Does the current profile point at an endpoint that still exists? */
+    hasWebhook: function () { return hasWebhook(currentProfile.webhookId); },
     /* Turn a name into the { hash, len } pair that goes in the config. Uses the
        salt / hashIterations / caseSensitive currently loaded, so every entry has
        to be regenerated if you change any of those. */

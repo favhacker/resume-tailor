@@ -41,6 +41,19 @@ window.RT_ACCESS_CONFIG = {
   // Where to send someone who is sitting on a tab that just became blocked.
   fallbackTab: 'home',
 
+  /* Make Profile > Integrations > Webhook a precondition for generating. With
+     this on, `blockedTabs` stays hidden until the profile points at an endpoint
+     that webhook.config.js still lists - so a profile that sends no events
+     cannot produce a resume. Selecting "None", or keeping an id that has since
+     been removed from webhook.config.js, both count as unset.
+
+     The Profile tab marks the dropdown required while this is on.
+
+     Safety valve: if webhook.config.js offers no usable endpoint at all, no
+     profile could ever satisfy this, so the rule is ignored (with a console
+     warning) rather than locking everyone out. */
+  requireWebhook: true,
+
   /* Default matching rule, applied to every entry in `blocklist` that does not
      override it:
        'startsWith' - the name begins with the entry ("Alex" blocks
@@ -91,7 +104,12 @@ window.RT_ACCESS_CONFIG = {
     { hash: 'eee878c2e83b5bc7e3a44c392d9e7809f8ffff44a7b11bdf645161e4f4e4ca61', len:  8, note: 'S1' }
   ],
 
-  /* Shown on the page in place of the blocked tab's content, if the app ever
-     renders it before navigating away. Keep it short. */
+  /* Shown on the page in place of a blocked tab's content, if the app ever
+     renders it before navigating away. Keep these short. `message` is the
+     fallback for a reason with no entry in `messages`. */
+  messages: {
+    blocklist: 'This profile does not have access to the Preview tab.',
+    webhook: 'Choose a webhook under Profile > Integrations to unlock the Preview tab.'
+  },
   message: 'This profile does not have access to the Preview tab.'
 };
