@@ -1,3 +1,1568 @@
+/*RT_ACCESS_EMBED_START*/(function(){
+/* --- webhook.config.js --- */
+/* Resume Tailor - webhook options
+ *
+ * The list below populates the dropdown in the app under
+ * Profile > Integrations > Webhook. Whichever entry the user picks is saved
+ * with their profile like any other field.
+ *
+ * Choosing an endpoint is OPTIONAL - the dropdown always offers "None", and
+ * with nothing selected no request is made. Events are still logged to the
+ * console and dispatched as DOM events either way.
+ *
+ * This file is the editable source of truth for the list, but it is NO LONGER
+ * served on its own - it is baked into the app bundle alongside the access
+ * guard, so neither can be defeated by blocking a request. After editing, run:
+ *
+ *     node embed-access.mjs && node stamp-cache-version.mjs
+ *
+ * Editing it through GitHub's web UI alone will NOT change the live page.
+ *
+ * Each event sends: the profile name, the target company (resume.generated),
+ * the user's public IP address and country (see clientInfo below), and counts
+ * and flags about the profile / resume. Email, phone, location, links,
+ * summary, bullet text, skill names and endpoint URLs are never sent. See the
+ * redact section of assets/webhook.js.
+ *
+ * Name and IP address are personal data. If other people use this page, tell
+ * them it is collected and where it goes.
+ */
+window.RT_WEBHOOK_CONFIG = {
+  // Master switch. false disables delivery, logging and DOM events entirely.
+  enabled: true,
+
+  // Console logging of every event. Set false to quieten it.
+  log: true,
+
+  /* The dropdown items. Replace these with your own.
+   *
+   *   id    - stable key stored in the profile. Keep it stable: changing an id
+   *           orphans any profile that had it selected (the app shows a clear
+   *           warning when that happens). Changing the url is always safe.
+   *   label - what the user sees in the dropdown.
+   *   type  - wire format:
+   *             'generic' (default) - POSTs the JSON event envelope as-is.
+   *             'discord'           - sends a Discord message (one embed per
+   *                                   event, @mentions disabled). The url must
+   *                                   be https://discord.com/api/webhooks/{id}/{token}.
+   *                                   Left out, a Discord url is detected
+   *                                   automatically.
+   *   url   - where events are POSTed. Must be http(s).
+   *   mode  - optional, per-endpoint override of the global `mode` below
+   *           (always 'cors' for Discord, which requires JSON).
+   *   headers - optional, per-endpoint extra headers (merged over the global).
+   *
+   *   Discord-only, all optional:
+   *   username   - overrides the webhook's display name. 1-80 chars, and may
+   *                not contain "clyde" or "discord" (Discord rejects those).
+   *   avatarUrl  - overrides the webhook's avatar image (http(s) url).
+   *   threadId   - post into this existing thread (numeric id).
+   *   threadName - for forum/media channels: create a thread with this name.
+   *                Discord requires threadId or threadName for those channels.
+   *
+   * These URLs ship to the browser and are readable by anyone viewing source.
+   * A Discord webhook url contains its token, so anyone who can see it can
+   * post to (or delete) the webhook. Do not publish one you are not willing to
+   * have abused; regenerate it in Discord if it leaks.
+   */
+  endpoints: [
+    { id: "Olek's Server", label: 'oleks-discord', type: 'discord', url: 'https://discord.com/api/webhooks/1549751946150150235/i3HOr4P1mf99RagfAMIy6Ugf6HNuFGch_psPede3bwhjIf5_h9pDWcfGzRDTCw6PAyWF' },
+  ],
+
+  // Used when a profile has nothing selected yet. Leave '' to default to None.
+  defaultEndpointId: '',
+
+  // 'cors'    - normal POST; your endpoint must send Access-Control-Allow-Origin.
+  //             Delivery success/failure is known, so retries work properly.
+  // 'no-cors' - fire-and-forget for generic endpoints without CORS headers
+  //             (e.g. some Zapier / Make hooks). The browser hides the response,
+  //             so failures cannot be detected and retries are best-effort.
+  //             Not used for Discord, which supports CORS.
+  mode: 'cors',
+
+  // Extra headers for every endpoint, e.g. { 'X-Api-Key': '...' }. Ignored when
+  // the effective mode is 'no-cors', which only permits a simple Content-Type.
+  headers: {},
+
+  // Per-event switches. Delete or set false to mute one.
+  events: {
+    'profile.updated': true,
+    'resume.generated': true,
+    'profile.imported': true,
+    'profile.exported': true
+  },
+
+  // Profile edits autosave on every keystroke; wait this long after typing
+  // stops before emitting profile.updated.
+  debounceMs: 2000,
+
+  // Drop an identical event (same type + same data) seen again within this many
+  // ms - guards against a single action firing twice (e.g. paste + change).
+  // Set 0 to disable. Keep it short so intentional repeats still get through.
+  dedupeMs: 4000,
+
+  // Failed deliveries retry with exponential backoff, then park in
+  // localStorage and flush on the next event or page load.
+  retry: { attempts: 3, backoffMs: 800 },
+
+  // Free-form label included in every envelope, to tell deploys apart.
+  source: 'resume-tailor',
+
+  /* Public IP address + country of the person using the page. A browser cannot
+   * see its own public IP, so it is fetched from the providers below, tried in
+   * order until one answers. Note that this sends the user's IP to that
+   * provider too.
+   *
+   *   enabled      - false to omit IP / country from events entirely.
+   *   providers    - HTTPS lookup urls, no API key needed. Responses shaped like
+   *                  geojs.io, ipwho.is, ipapi.co or ipinfo.io are understood.
+   *   timeoutMs    - per-provider wait before trying the next one. If all fail,
+   *                  events are still sent, with ip / country set to null.
+   *   cacheMinutes - reuse the result for this long within a browser session.
+   */
+  clientInfo: {
+    enabled: true,
+    providers: [
+      'https://get.geojs.io/v1/ip/geo.json',
+      'https://ipwho.is/',
+      'https://ipapi.co/json/',
+      'https://ipinfo.io/json'
+    ],
+    timeoutMs: 3000,
+    cacheMinutes: 30
+  }
+};
+
+/* --- webhook.js --- */
+/* Resume Tailor - event bus + webhook dispatcher
+ *
+ * Loaded before the app bundle. Exposes:
+ *
+ *   window.RTEmit(type, context)   - called by the bundle at four points:
+ *       profile.updated   - profile autosaved (debounced + deduped)
+ *       resume.generated  - a tailored PDF was produced
+ *       profile.exported  - details written to a JSON file
+ *       profile.imported  - details loaded back from a JSON file
+ *
+ *   window.RTWebhookOptions()      - [{ id, label }] for the Profile tab
+ *                                    dropdown, built from webhook.config.js
+ *
+ * Every event does three things:
+ *   1. logs to the console
+ *   2. bubbles as a DOM CustomEvent from <html>, so anything on the page (or a
+ *      browser extension) can listen without touching the bundle:
+ *        document.addEventListener('resume-tailor:event', e => ...)        // all
+ *        document.addEventListener('resume-tailor:resume.generated', ...)  // one
+ *   3. POSTs to the selected endpoint, IF one is selected and valid
+ *
+ * Endpoint types decide the wire format:
+ *   generic - the JSON envelope below, as-is
+ *   discord - a Discord "Execute Webhook" message: one embed per event,
+ *             mentions disabled, sized to Discord's embed limits, sent with
+ *             ?wait=true so failures are reported instead of silently dropped
+ *
+ * The endpoint is chosen in Profile > Integrations > Webhook and stored in the
+ * profile as `webhookId`. Selection is entirely OPTIONAL: with "None" chosen,
+ * an id that no longer exists in the config, or a malformed URL, nothing is
+ * sent and nothing throws - events still log and bubble as normal.
+ *
+ * DATA SENT: the caller hands us raw app state, but only redact() output ever
+ * leaves the page. Each event carries:
+ *   - the profile name and (for resume.generated) the target company
+ *   - the user's public IP address and country, looked up from an external
+ *     service (see clientInfo in webhook.config.js)
+ *   - counts and booleans describing the profile / resume
+ * It never includes email, phone, location, links, summary prose, bullet text,
+ * skill names, or endpoint URLs. The Discord formatter only re-presents that
+ * same data.
+ */
+(function () {
+  'use strict';
+
+  var SCHEMA_VERSION = 1;
+  var PROFILE_KEY = 'resume-tailor:profile';
+  var STATE_KEY = 'resume-tailor:webhook-state';
+  var QUEUE_KEY = 'resume-tailor:webhook-queue';
+  var MAX_QUEUE = 50;
+  var LOG_PREFIX = '[resume-tailor]';
+  var TYPES = { generic: true, discord: true };
+
+  /* https://discord.com/api/webhooks/{webhook.id}/{webhook.token}
+     (also discordapp.com, canary./ptb. hosts, and an optional /v{n} API version) */
+  var DISCORD_URL = /^https:\/\/(?:(?:canary|ptb)\.)?discord(?:app)?\.com\/api(?:\/v\d+)?\/webhooks\/\d+\/[\w-]+\/?(?:\?.*)?$/i;
+
+  /* ----------------------------------------------------------- config --- */
+
+  function cfg() {
+    var c = window.RT_WEBHOOK_CONFIG;
+    if (!c || typeof c !== 'object' || c.enabled === false) return null;
+    return c;
+  }
+
+  function log() {
+    var c = cfg();
+    if (c && c.log === false) return;
+    try { console.log.apply(console, arguments); } catch (e) { /* no console */ }
+  }
+
+  var warned = {};
+  function warnOnce(key, msg, extra) {
+    if (warned[key]) return;
+    warned[key] = true;
+    try { console.warn(LOG_PREFIX, msg, extra === undefined ? '' : extra); } catch (e) { /* ignore */ }
+  }
+
+  function isValidUrl(u) {
+    if (typeof u !== 'string' || !u) return false;
+    if (!/^https?:\/\//i.test(u)) return false;
+    try { new URL(u); return true; } catch (e) { return false; }
+  }
+
+  function str(v) { return typeof v === 'string' ? v.trim() : ''; }
+
+  /* Sanitised endpoint list. Bad entries are skipped with a one-time warning
+     rather than breaking the dropdown. */
+  function endpoints() {
+    var c = cfg();
+    var list = c && Array.isArray(c.endpoints) ? c.endpoints : [];
+    var out = [], seen = {};
+    for (var i = 0; i < list.length; i++) {
+      var ep = list[i];
+      if (!ep || typeof ep !== 'object') continue;
+      var id = str(ep.id), url = str(ep.url), where = 'webhook.config.js endpoint "' + (id || '#' + (i + 1)) + '"';
+      if (!id) { warnOnce('ep-noid-' + i, where + ' has no id; skipped'); continue; }
+      if (seen[id]) { warnOnce('ep-dup-' + id, where + ' duplicates an earlier id; skipped'); continue; }
+      if (!isValidUrl(url)) { warnOnce('ep-url-' + id, where + ' has an invalid url; skipped'); continue; }
+
+      var type = str(ep.type).toLowerCase();
+      if (!type) {
+        // generic JSON would always be rejected by Discord, so infer it
+        type = DISCORD_URL.test(url) ? 'discord' : 'generic';
+        if (type === 'discord') warnOnce('ep-infer-' + id, where + ' has no type but is a Discord webhook url; treating it as type "discord"');
+      }
+      if (!TYPES[type]) { warnOnce('ep-type-' + id, where + ' has unknown type "' + type + '" (expected generic or discord); skipped'); continue; }
+
+      var norm = {
+        id: id,
+        label: str(ep.label) || id,
+        type: type,
+        url: url,
+        mode: ep.mode === 'no-cors' || ep.mode === 'cors' ? ep.mode : null,
+        headers: ep.headers && typeof ep.headers === 'object' ? ep.headers : null
+      };
+
+      if (type === 'discord') {
+        if (!DISCORD_URL.test(url)) {
+          warnOnce('ep-dcurl-' + id, where + ' is type "discord" but the url is not https://discord.com/api/webhooks/{id}/{token}; skipped');
+          continue;
+        }
+        if (norm.mode === 'no-cors') {
+          // no-cors cannot send application/json, which Discord requires
+          warnOnce('ep-dcmode-' + id, where + ': mode "no-cors" is not usable with Discord; using "cors"');
+        }
+        norm.mode = 'cors';
+        norm.discord = discordOptions(ep, where, id);
+      }
+
+      seen[id] = true;
+      out.push(norm);
+    }
+    return out;
+  }
+
+  /* Optional Discord message overrides, validated against Discord's rules so a
+     bad value is dropped with a warning instead of making every send fail. */
+  function discordOptions(ep, where, id) {
+    var o = {};
+    var username = str(ep.username);
+    if (username) {
+      // webhook names are 1-80 chars and may not contain "clyde" or "discord"
+      if (username.length > 80 || /clyde|discord/i.test(username)) {
+        warnOnce('dc-user-' + id, where + ': username must be 1-80 chars and not contain "clyde" or "discord"; ignored');
+      } else { o.username = username; }
+    }
+    var avatar = str(ep.avatarUrl);
+    if (avatar) {
+      if (/^https?:\/\//i.test(avatar)) o.avatar_url = avatar;
+      else warnOnce('dc-avatar-' + id, where + ': avatarUrl must be an http(s) url; ignored');
+    }
+    var threadId = str(ep.threadId);
+    if (threadId) {
+      if (/^\d+$/.test(threadId)) o.threadId = threadId;
+      else warnOnce('dc-thread-' + id, where + ': threadId must be a numeric snowflake; ignored');
+    }
+    var threadName = str(ep.threadName);
+    if (threadName) o.thread_name = threadName.slice(0, 100);
+    return o;
+  }
+
+  /* The id stored in the profile, or the config default when none is chosen. */
+  function selectedId() {
+    try {
+      var stored = localStorage.getItem(PROFILE_KEY);
+      if (stored) {
+        var p = JSON.parse(stored);
+        if (p && typeof p.webhookId === 'string' && p.webhookId.trim()) return p.webhookId.trim();
+      }
+    } catch (e) { /* unreadable/corrupt profile - fall through to default */ }
+    var c = cfg();
+    return c && typeof c.defaultEndpointId === 'string' ? c.defaultEndpointId.trim() : '';
+  }
+
+  /* The selected endpoint with effective mode/headers, or null when none is
+     selected (the normal case) or the selection cannot be used. */
+  function resolve() {
+    var c = cfg();
+    if (!c) return null;
+    var id = selectedId();
+    if (!id) return null;                               // "None" - optional
+    var list = endpoints();
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].id !== id) continue;
+      var ep = list[i], headers = {};
+      [c.headers, ep.headers].forEach(function (h) {
+        if (h && typeof h === 'object') Object.keys(h).forEach(function (k) { headers[k] = h[k]; });
+      });
+      return {
+        id: ep.id, type: ep.type, url: ep.url, discord: ep.discord || null,
+        mode: ep.mode || (c.mode === 'no-cors' ? 'no-cors' : 'cors'),
+        headers: headers
+      };
+    }
+    warnOnce('missing-' + id, 'selected webhook is not in webhook.config.js (or was skipped as invalid), so no events are being sent:', id);
+    return null;
+  }
+
+  function wants(type) {
+    var c = cfg();
+    if (!c) return false;
+    var m = c.events;
+    if (!m || typeof m !== 'object') return true;
+    return m[type] !== false;
+  }
+
+  /* ------------------------------------------------------------ utils --- */
+
+  function has(v) { return typeof v === 'string' && v.trim().length > 0; }
+  function arr(v) { return Array.isArray(v) ? v : []; }
+  function num(v) { var n = parseInt(v, 10); return isNaN(n) ? 0 : n; }
+
+  function readJSON(key, fallback) {
+    try {
+      var raw = localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : fallback;
+    } catch (e) { return fallback; }
+  }
+
+  function writeJSON(key, value) {
+    try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { /* quota / private mode */ }
+  }
+
+  function uuid() {
+    try {
+      if (crypto && crypto.randomUUID) return crypto.randomUUID();
+    } catch (e) { /* fall through */ }
+    return 'e-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+  }
+
+  var sessionId = (function () {
+    try {
+      var id = sessionStorage.getItem('resume-tailor:session');
+      if (!id) { id = uuid(); sessionStorage.setItem('resume-tailor:session', id); }
+      return id;
+    } catch (e) { return uuid(); }
+  })();
+
+  /* ------------------------------------------------------ client info --- */
+  /* A page cannot see its own public IP, so it is fetched from the providers in
+     config.clientInfo, tried in order. Each response shape is normalised and
+     the result cached for the session. The lookup never throws and waits at
+     most timeoutMs per provider; if every provider fails the fields are null
+     and the event is still sent. */
+
+  var CLIENT_KEY = 'resume-tailor:client';
+  var CLIENT_RETRY_MS = 60000;
+  var clientPromise = null;
+  var clientFailedAt = 0;
+
+  function emptyClient() { return { ip: null, country: null, countryCode: null }; }
+
+  function clientCfg() {
+    var c = cfg();
+    var ci = c && c.clientInfo;
+    if (!ci || typeof ci !== 'object' || ci.enabled === false) return null;
+    var providers = arr(ci.providers).map(str).filter(function (u) { return /^https:\/\//i.test(u) && isValidUrl(u); });
+    if (!providers.length) return null;
+    var minutes = ci.cacheMinutes == null ? 30 : Number(ci.cacheMinutes);
+    return {
+      providers: providers,
+      timeoutMs: Math.max(200, num(ci.timeoutMs) || 3000),
+      cacheMs: Math.max(0, isNaN(minutes) ? 30 : minutes) * 60000
+    };
+  }
+
+  var IPV4 = /^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$/;
+  function isIp(v) {
+    if (typeof v !== 'string') return false;
+    v = v.trim();
+    return IPV4.test(v) || (v.indexOf(':') !== -1 && /^[0-9a-f:.]{2,45}$/i.test(v));
+  }
+
+  function countryName(code) {
+    try {
+      if (typeof Intl !== 'undefined' && Intl.DisplayNames) {
+        var n = new Intl.DisplayNames(['en'], { type: 'region' }).of(code);
+        if (n && n !== code) return n;
+      }
+    } catch (e) { /* unknown code or no Intl support */ }
+    return null;
+  }
+
+  /* Understands geojs / ipwho.is ({ ip, country, country_code }),
+     ipapi.co ({ ip, country_name, country_code }) and ipinfo.io ({ ip, country: "DE" }). */
+  function normaliseClient(j) {
+    if (!j || typeof j !== 'object' || j.success === false || j.error === true) return null;
+    var ip = [j.ip, j.ipAddress, j.query].filter(isIp)[0];
+    if (!ip) return null;
+    var code = [j.country_code, j.countryCode, j.country].map(str)
+      .filter(function (c) { return /^[A-Za-z]{2}$/.test(c); })[0] || null;
+    if (code) code = code.toUpperCase();
+    var name = [j.country_name, j.countryName, j.country].map(str)
+      .filter(function (c) { return c.length > 2; })[0] || null;
+    if (!name && code) name = countryName(code);
+    return { ip: ip.trim(), country: name ? name.slice(0, 100) : null, countryCode: code };
+  }
+
+  function withTimeout(promise, ms, onTimeout) {
+    return new Promise(function (done) {
+      var settled = false;
+      var t = setTimeout(function () {
+        if (settled) return;
+        settled = true;
+        try { if (onTimeout) onTimeout(); } catch (e) { /* ignore */ }
+        done(null);
+      }, ms);
+      promise.then(
+        function (v) { if (!settled) { settled = true; clearTimeout(t); done(v); } },
+        function () { if (!settled) { settled = true; clearTimeout(t); done(null); } }
+      );
+    });
+  }
+
+  function lookupClient() {
+    var cc = clientCfg();
+    if (!cc) return Promise.resolve(emptyClient());
+    if (clientPromise) return clientPromise;
+    if (clientFailedAt && Date.now() - clientFailedAt < CLIENT_RETRY_MS) return Promise.resolve(emptyClient());
+
+    try {
+      var cached = JSON.parse(sessionStorage.getItem(CLIENT_KEY) || 'null');
+      if (cached && isIp(cached.ip) && Date.now() - cached.at < cc.cacheMs) {
+        clientPromise = Promise.resolve({ ip: cached.ip, country: cached.country || null, countryCode: cached.countryCode || null });
+        return clientPromise;
+      }
+    } catch (e) { /* no usable cache */ }
+
+    function tryProvider(i) {
+      if (i >= cc.providers.length) return Promise.resolve(null);
+      var ctrl = null;
+      try { ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null; } catch (e) { ctrl = null; }
+      var req;
+      try {
+        var opts = { method: 'GET', credentials: 'omit' };
+        if (ctrl) opts.signal = ctrl.signal;
+        req = Promise.resolve(fetch(cc.providers[i], opts))
+          .then(function (r) { return r && r.ok ? r.json() : null; })
+          .then(normaliseClient);
+      } catch (e) { req = Promise.resolve(null); }
+      return withTimeout(req, cc.timeoutMs, function () { if (ctrl) ctrl.abort(); })
+        .then(function (info) { return info || tryProvider(i + 1); });
+    }
+
+    var pending = tryProvider(0).then(function (info) {
+      if (!info) {
+        warnOnce('client-lookup', 'could not look up IP address / country; events are sent without them');
+        clientFailedAt = Date.now();
+        clientPromise = null;                         // let a later event try again
+        return emptyClient();
+      }
+      clientFailedAt = 0;
+      try {
+        sessionStorage.setItem(CLIENT_KEY, JSON.stringify({ at: Date.now(), ip: info.ip, country: info.country, countryCode: info.countryCode }));
+      } catch (e) { /* storage unavailable */ }
+      return info;
+    }).catch(function () { clientPromise = null; return emptyClient(); });
+    clientPromise = pending;
+    return pending;
+  }
+
+  /* ---------------------------------------------------------- redact --- */
+  /* The only place app state is turned into an outbound payload.           */
+
+  function profileMeta(p) {
+    if (!p || typeof p !== 'object') return null;
+    var work = arr(p.workExperiences), edu = arr(p.educations), cert = arr(p.certifications);
+
+    // booleans only - which fields are filled, never their values
+    var fields = {
+      fullName: has(p.fullName), email: has(p.email), phone: has(p.phone),
+      location: has(p.location), linkedIn: has(p.linkedIn), gitHub: has(p.gitHub),
+      website: has(p.website), seniority: has(p.seniority), jobTitle: has(p.jobTitle)
+    };
+    var names = Object.keys(fields);
+    var filled = names.filter(function (k) { return fields[k]; }).length;
+
+    return {
+      fields: fields,
+      fieldsFilled: filled,
+      fieldsTotal: names.length,
+      completeness: names.length ? Math.round((filled / names.length) * 100) : 0,
+      roleBasedJobTitle: !!p.roleBasedJobTitle,
+      // whether a webhook is selected - never which one or where it points
+      webhookConfigured: has(p.webhookId),
+      counts: {
+        workExperiences: work.length,
+        workExperiencesFilled: work.filter(function (e) { return has(e && e.company); }).length,
+        educations: edu.length,
+        educationsFilled: edu.filter(function (e) { return has(e && e.degreeMajor); }).length,
+        certifications: cert.length,
+        certificationsFilled: cert.filter(function (e) { return has(e && e.certification); }).length,
+        requestedBulletPoints: work.reduce(function (n, e) { return n + num(e && e.bulletPoints); }, 0)
+      }
+    };
+  }
+
+  function resumeMeta(r) {
+    if (!r || typeof r !== 'object') return null;
+    var exp = arr(r.experience), skills = arr(r.skills);
+    return {
+      experienceCount: exp.length,
+      bulletCount: exp.reduce(function (n, e) { return n + arr(e && e.bullets).length; }, 0),
+      skillCategoryCount: skills.length,
+      skillCount: skills.reduce(function (n, s) { return n + arr(s && s.skills).length; }, 0),
+      educationCount: arr(r.education).length,
+      certificationCount: arr(r.certifications).length,
+      hasSummary: has(r.summary),
+      summaryLength: has(r.summary) ? r.summary.trim().length : 0,
+      // how many <b> spans the LLM produced, i.e. keyword emphasis density
+      boldSpans: exp.reduce(function (n, e) {
+        return n + arr(e && e.bullets).reduce(function (m, b) {
+          return m + (String(b).match(/<b>/gi) || []).length;
+        }, 0);
+      }, 0)
+    };
+  }
+
+  function settingsMeta(s) {
+    if (!s || typeof s !== 'object') return null;
+    var p = s.primary || {}, l = s.pageLayout || {};
+    return {
+      fontFamily: p.fontFamily || null,
+      fontSize: p.fontSize || null,
+      experienceLayout: s.experienceLayout || null,
+      boostEducation: !!s.boostEducation,
+      pageMargin: l.pageMargin || null
+    };
+  }
+
+  /* The profile name for any event. Profile events carry the profile; the two
+     resume.generated calls carry the rendered resume (whose `name` is the
+     profile's full name). We try, in order: the event's own profile, the
+     event's resume, then ALWAYS the saved profile - so no event can omit the
+     name while one is saved. Returns null only when no name exists anywhere. */
+  function profileName(ctx) {
+    ctx = ctx || {};
+    var candidates = [
+      ctx.profile && typeof ctx.profile === 'object' ? ctx.profile.fullName : null,
+      ctx.resume && typeof ctx.resume === 'object' ? ctx.resume.name : null
+    ];
+    var n = candidates.filter(has)[0];
+    if (!has(n)) {
+      var p = readJSON(PROFILE_KEY, null);
+      if (p && has(p.fullName)) n = p.fullName;
+    }
+    return has(n) ? n.trim().replace(/\s+/g, ' ').slice(0, 100) : null;
+  }
+
+  function redact(type, ctx) {
+    ctx = ctx || {};
+    var data = { profileName: profileName(ctx) };
+    switch (type) {
+      case 'profile.updated':
+        data.profile = profileMeta(ctx.profile);
+        break;
+      case 'resume.generated':
+        data.company = has(ctx.company) ? ctx.company.trim() : null;
+        data.source = ctx.source || null;
+        data.resume = resumeMeta(ctx.resume);
+        data.settings = settingsMeta(ctx.settings);
+        break;
+      case 'profile.exported':
+      case 'profile.imported':
+        data.method = ctx.method || null;
+        data.profile = profileMeta(ctx.profile);
+        data.settings = settingsMeta(ctx.settings);
+        data.hasJsonResponse = has(ctx.jsonResponse);
+        break;
+      default:
+        break;
+    }
+    return data;
+  }
+
+  /* --------------------------------------------------- discord format --- */
+  /* Discord embed limits: title 256, description 4096, 25 fields, field name
+     256, field value 1024, footer 2048, 6000 characters across the embed.     */
+
+  var DC = {
+    'resume.generated': { title: 'Resume generated', color: 0x57F287 },
+    'profile.updated': { title: 'Profile updated', color: 0x5865F2 },
+    'profile.exported': { title: 'Profile exported', color: 0xFEE75C },
+    'profile.imported': { title: 'Profile imported', color: 0xEB459E }
+  };
+  var SOURCES = { 'preview-download': 'Preview download', 'auto-paste': 'Auto-download on paste' };
+  var METHODS = { 'file-picker': 'Save dialog', download: 'Browser download' };
+
+  function clip(s, n) {
+    s = String(s == null ? '' : s);
+    return s.length > n ? s.slice(0, n - 1) + '\u2026' : s;
+  }
+
+  /* The company name comes from LLM output, so it is untrusted text: strip
+     control characters, escape markdown, and break @mentions (allowed_mentions
+     below also stops them pinging). */
+  function safeText(s, n) {
+    var t = String(s == null ? '' : s)
+      .replace(/[\u0000-\u001f\u007f\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]/g, ' ')
+      .replace(/\s+/g, ' ').trim();
+    t = clip(t, n)
+      .replace(/([\\*_~`|>#\[\]()])/g, '\\$1')
+      .replace(/@/g, '@\u200b');
+    return t;
+  }
+
+  function yesNo(b) { return b ? 'Yes' : 'No'; }
+  function field(name, value, inline) {
+    var v = String(value == null || value === '' ? 'n/a' : value);
+    return { name: clip(name, 256), value: clip(v, 1024), inline: inline !== false };
+  }
+
+  function profileFields(p) {
+    if (!p) return [field('Profile', 'unavailable', false)];
+    var c = p.counts || {};
+    return [
+      field('Completeness', p.completeness + '% (' + p.fieldsFilled + '/' + p.fieldsTotal + ' fields)'),
+      field('Work experience', c.workExperiencesFilled + ' of ' + c.workExperiences + ' filled'),
+      field('Requested bullets', c.requestedBulletPoints),
+      field('Education', c.educationsFilled + ' of ' + c.educations + ' filled'),
+      field('Certifications', c.certificationsFilled + ' of ' + c.certifications + ' filled'),
+      field('Role-based title', yesNo(p.roleBasedJobTitle))
+    ];
+  }
+
+  function discordBody(env, ep) {
+    var d = env.data || {};
+    var meta = DC[env.type] || { title: clip(String(env.type), 200), color: 0x99AAB5 };
+    var embed = { title: meta.title, color: meta.color, fields: [] };
+    var lines = ['Profile: ' + (has(d.profileName) ? '**' + safeText(d.profileName, 100) + '**' : '_not set_')];
+
+    switch (env.type) {
+      case 'resume.generated': {
+        lines.push('Target company: ' + (has(d.company) ? '**' + safeText(d.company, 200) + '**' : '_not specified_'));
+        var r = d.resume || {}, s = d.settings || {};
+        embed.fields.push(
+          field('Source', SOURCES[d.source] || d.source),
+          field('Experience entries', r.experienceCount),
+          field('Bullet points', r.bulletCount),
+          field('Skills', r.skillCount != null ? r.skillCount + ' in ' + r.skillCategoryCount + ' categories' : null),
+          field('Bold keywords', r.boldSpans),
+          field('Summary', r.hasSummary ? 'Yes (' + r.summaryLength + ' chars)' : 'No'),
+          field('Education', r.educationCount),
+          field('Certifications', r.certificationCount),
+          field('Layout', s.fontFamily ? s.fontFamily + ' ' + (s.fontSize || '?') + 'pt, ' + (s.experienceLayout || 'default') : null)
+        );
+        break;
+      }
+      case 'profile.updated':
+        embed.fields = profileFields(d.profile);
+        break;
+      case 'profile.exported':
+      case 'profile.imported':
+        embed.fields = [field('Method', METHODS[d.method] || d.method || 'File upload')]
+          .concat(profileFields(d.profile))
+          .concat([field('Includes JSON response', yesNo(d.hasJsonResponse))]);
+        break;
+      default:
+        lines.push('Unrecognised event.');
+    }
+
+    // IP / country come from a third-party lookup, so they are escaped as untrusted text.
+    // Shown in the description (not a field) so they are clearly visible up top.
+    var cl = d.client || {};
+    var country = has(cl.country)
+      ? safeText(cl.country, 100) + (has(cl.countryCode) ? ' (' + safeText(cl.countryCode, 2) + ')' : '')
+      : (has(cl.countryCode) ? safeText(cl.countryCode, 2) : 'unknown');
+    lines.push('IP address: ' + (has(cl.ip) ? '**' + safeText(cl.ip, 45) + '**' : '_unknown_') + ' - ' + country);
+
+    embed.description = clip(lines.join(String.fromCharCode(10)), 4096);
+    embed.fields = embed.fields.slice(0, 25);
+    embed.footer = { text: clip(env.source + ' \u2022 session ' + String(env.sessionId).slice(0, 8), 2048) };
+    if (env.occurredAt) embed.timestamp = env.occurredAt;
+
+    // stay inside the 6000-character total by shedding fields from the end
+    function size(e) {
+      return (e.title || '').length + (e.description || '').length + e.footer.text.length +
+        e.fields.reduce(function (n, f) { return n + f.name.length + f.value.length; }, 0);
+    }
+    while (size(embed) > 6000 && embed.fields.length) embed.fields.pop();
+
+    var body = {
+      embeds: [embed],
+      allowed_mentions: { parse: [] }              // never ping anyone
+    };
+    var o = ep.discord || {};
+    if (o.username) body.username = o.username;
+    if (o.avatar_url) body.avatar_url = o.avatar_url;
+    if (o.thread_name) body.thread_name = o.thread_name;
+    return body;
+  }
+
+  function discordUrl(ep) {
+    try {
+      var u = new URL(ep.url);
+      u.searchParams.set('wait', 'true');          // report failures instead of silently dropping
+      if (ep.discord && ep.discord.threadId) u.searchParams.set('thread_id', ep.discord.threadId);
+      return u.toString();
+    } catch (e) { return ep.url; }
+  }
+
+  /* -------------------------------------------------------- transport --- */
+
+  function request(env, ep) {
+    if (ep.type === 'discord') {
+      return { url: discordUrl(ep), body: JSON.stringify(discordBody(env, ep)), mode: 'cors' };
+    }
+    return { url: ep.url, body: JSON.stringify(env), mode: ep.mode };
+  }
+
+  /* Resolves to { result: 'ok'|'retry'|'drop'|'skip', wait?: ms } */
+  function post(env, ep) {
+    if (!ep || !ep.url) return Promise.resolve({ result: 'skip' });
+
+    var req;
+    try { req = request(env, ep); } catch (e) {
+      warnOnce('fmt-' + ep.id, 'could not build the request for ' + ep.id + '; event dropped', e);
+      return Promise.resolve({ result: 'drop' });
+    }
+
+    var opts = { method: 'POST', body: req.body, keepalive: true };
+    if (req.mode === 'no-cors') {
+      opts.mode = 'no-cors';
+      // no-cors permits only simple headers; application/json would be blocked
+      opts.headers = { 'Content-Type': 'text/plain;charset=UTF-8' };
+    } else {
+      opts.headers = { 'Content-Type': 'application/json' };
+      Object.keys(ep.headers || {}).forEach(function (k) { opts.headers[k] = ep.headers[k]; });
+    }
+
+    try {
+      return fetch(req.url, opts).then(function (res) {
+        if (opts.mode === 'no-cors') return { result: 'ok' };   // opaque response, assume sent
+        if (res.ok) return { result: 'ok' };
+        if (res.status === 429) return retryAfter(res).then(function (ms) { return { result: 'retry', wait: ms }; });
+        // other client errors (bad token, deleted webhook, malformed body) will not fix themselves
+        if (res.status >= 400 && res.status < 500 && res.status !== 408) {
+          return describe(res).then(function (why) {
+            warnOnce('drop-' + ep.id + '-' + res.status, 'webhook ' + ep.id + ' rejected the event (HTTP ' + res.status + '); not retrying', why);
+            return { result: 'drop' };
+          });
+        }
+        return { result: 'retry' };
+      }).catch(function () { return { result: 'retry' }; });
+    } catch (e) {
+      return Promise.resolve({ result: 'retry' });              // fetch missing/blocked
+    }
+  }
+
+  /* Rate limits: Discord sends retry_after (seconds) in the body and a
+     Retry-After header. Capped so a bad value cannot stall the queue. */
+  function retryAfter(res) {
+    var header = 0;
+    try { header = parseFloat(res.headers && res.headers.get && res.headers.get('Retry-After')) || 0; } catch (e) { /* ignore */ }
+    var body = res.json ? res.json().catch(function () { return null; }) : Promise.resolve(null);
+    return body.then(function (j) {
+      var secs = j && typeof j.retry_after === 'number' ? j.retry_after : header;
+      return Math.min(Math.max(0, secs * 1000), 60000);
+    }).catch(function () { return 0; });
+  }
+
+  function describe(res) {
+    try {
+      if (!res.json) return Promise.resolve('');
+      return res.json().then(function (j) {
+        return j && (j.message || j.code) ? (j.code ? j.code + ' ' : '') + (j.message || '') : '';
+      }).catch(function () { return ''; });
+    } catch (e) { return Promise.resolve(''); }
+  }
+
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  function deliver(env) {
+    var ep = resolve();
+    if (!ep) return Promise.resolve(true);               // nothing to do, not a failure
+    var c = cfg() || {};
+    var retry = c.retry || {};
+    var attempts = Math.max(1, num(retry.attempts) || 3);
+    var backoff = Math.max(0, num(retry.backoffMs) || 800);
+
+    function attempt(i) {
+      return post(env, ep).then(function (out) {
+        if (out.result === 'ok') { log(LOG_PREFIX, 'delivered', env.type, '->', ep.id + ' (' + ep.type + ')'); return true; }
+        if (out.result === 'skip' || out.result === 'drop') return true;   // permanent; do not queue
+        if (i + 1 >= attempts) return false;
+        var wait = out.wait != null ? out.wait : backoff * Math.pow(2, i);
+        if (out.wait != null) log(LOG_PREFIX, 'rate limited by', ep.id + ', retrying in', Math.round(wait) + 'ms');
+        return sleep(wait).then(function () { return attempt(i + 1); });
+      }).catch(function () { return false; });
+    }
+    return attempt(0);
+  }
+
+  function enqueue(env) {
+    var q = readJSON(QUEUE_KEY, []);
+    if (!Array.isArray(q)) q = [];
+    q.push(env);
+    if (q.length > MAX_QUEUE) q = q.slice(q.length - MAX_QUEUE);
+    writeJSON(QUEUE_KEY, q);
+    log(LOG_PREFIX, 'queued for retry', env.type, '(' + q.length + ' pending)');
+  }
+
+  var flushing = false;
+  function flush() {
+    if (flushing || !resolve()) return Promise.resolve();
+    var q = readJSON(QUEUE_KEY, []);
+    if (!Array.isArray(q) || !q.length) return Promise.resolve();
+    flushing = true;
+    writeJSON(QUEUE_KEY, []);
+
+    var remaining = [];
+    return q.reduce(function (chain, env) {
+      return chain.then(function () {
+        return deliver(env).then(function (ok) { if (!ok) remaining.push(env); });
+      });
+    }, Promise.resolve()).then(function () {
+      if (remaining.length) {
+        var current = readJSON(QUEUE_KEY, []);
+        writeJSON(QUEUE_KEY, remaining.concat(Array.isArray(current) ? current : []).slice(0, MAX_QUEUE));
+      }
+      flushing = false;
+    }).catch(function () { flushing = false; });
+  }
+
+  /* ------------------------------------------------------------ emit --- */
+
+  function bubble(env) {
+    try {
+      var root = document.documentElement;
+      if (!root) return;
+      var init = { detail: env, bubbles: true, cancelable: false };
+      root.dispatchEvent(new CustomEvent('resume-tailor:' + env.type, init));
+      root.dispatchEvent(new CustomEvent('resume-tailor:event', init));
+    } catch (e) { /* never let instrumentation break the app */ }
+  }
+
+  function envelope(type, data) {
+    var c = cfg();
+    return {
+      id: uuid(),
+      type: type,
+      schemaVersion: SCHEMA_VERSION,
+      occurredAt: new Date().toISOString(),
+      source: (c && c.source) || 'resume-tailor',
+      sessionId: sessionId,
+      page: (function () { try { return location.origin + location.pathname; } catch (e) { return null; } })(),
+      data: data
+    };
+  }
+
+  /* Idempotency guard. The same logical action can reach RTEmit twice - most
+     often the paste flow, where a `paste` event and the following `change`
+     event both trigger the same download. We fingerprint each event by its
+     (type + redacted data) and drop an identical one seen within a short
+     window. Recorded synchronously below, before the async IP lookup, so a
+     same-tick double-fire is caught. Window is configurable (dedupeMs). */
+  var DEFAULT_DEDUPE_MS = 4000;
+  var recentSends = {};
+  function dedupeWindow() {
+    var c = cfg();
+    var n = c && c.dedupeMs != null ? Number(c.dedupeMs) : DEFAULT_DEDUPE_MS;
+    return isNaN(n) || n < 0 ? DEFAULT_DEDUPE_MS : n;
+  }
+  /* The fingerprint identifies "the same event", ignoring incidental metadata.
+     resume.generated fires from two paths (auto-paste and the preview Download
+     button) that produce near-identical messages differing only by `source`;
+     keying on profile + company collapses those into one. Other events key on
+     their full data. */
+  function dedupeKey(type, data) {
+    if (type === 'resume.generated') {
+      return type + '|' + (data.profileName || '') + '|' + (data.company || '');
+    }
+    try { return type + '|' + JSON.stringify(data); } catch (e) { return null; }
+  }
+  function isDuplicate(type, data) {
+    var win = dedupeWindow();
+    if (!win) return false;
+    var now = Date.now();
+    for (var k in recentSends) {
+      if (recentSends.hasOwnProperty(k) && now - recentSends[k] > win) delete recentSends[k];
+    }
+    var fp = dedupeKey(type, data);
+    if (fp == null) return false;
+    if (recentSends[fp] && now - recentSends[fp] < win) return true;
+    recentSends[fp] = now;
+    return false;
+  }
+
+  function dispatch(type, ctx) {
+    // snapshot app state and time now; the IP lookup below is asynchronous
+    var data = redact(type, ctx);
+    if (isDuplicate(type, data)) {
+      log(LOG_PREFIX, 'duplicate', type, 'suppressed (within ' + dedupeWindow() + 'ms)');
+      return Promise.resolve();
+    }
+    var at = new Date().toISOString();
+
+    return lookupClient().then(function (client) {
+      data.client = client;
+      var env = envelope(type, data);
+      env.occurredAt = at;
+      var ep = resolve();
+
+      log(LOG_PREFIX, type, env.data, ep ? '(sending to ' + ep.id + ' as ' + ep.type + ')' : '(no webhook selected - log only)');
+      bubble(env);                                 // always fires, webhook or not
+
+      if (!ep || !wants(type)) return;
+      flush();
+      deliver(env).then(function (ok) { if (!ok) enqueue(env); }).catch(function () { /* ignore */ });
+    }).catch(function (e) {
+      try { console.warn(LOG_PREFIX, 'event failed', type, e); } catch (e2) { /* ignore */ }
+    });
+  }
+
+  /* profile.updated fires from an autosave that runs on every keystroke, so it
+     is debounced, and deduped against the last payload we actually sent (kept in
+     localStorage so a reload does not re-emit an unchanged profile). */
+  var timer = null;
+  function dispatchProfile(ctx) {
+    var c = cfg();
+    var wait = c && num(c.debounceMs) ? num(c.debounceMs) : 2000;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(function () {
+      timer = null;
+      try {
+        var meta = profileMeta(ctx.profile);
+        if (!meta) return;
+        // the name is sent too, so renaming the profile counts as a change
+        var sig = JSON.stringify({ meta: meta, name: profileName(ctx) });
+        var state = readJSON(STATE_KEY, {}) || {};
+        if (state.lastProfileSig === sig) return;    // nothing materially changed
+        state.lastProfileSig = sig;
+        writeJSON(STATE_KEY, state);
+        dispatch('profile.updated', ctx);
+      } catch (e) { /* swallow */ }
+    }, wait);
+  }
+
+  window.RTEmit = function (type, ctx) {
+    try {
+      if (type === 'profile.updated') dispatchProfile(ctx || {});
+      else if (typeof type === 'string' && type) dispatch(type, ctx || {});
+    } catch (e) {
+      // instrumentation must never surface to the user
+      try { console.warn(LOG_PREFIX, 'event failed', type, e); } catch (e2) { /* ignore */ }
+    }
+  };
+
+  // Dropdown items for the Profile tab. Never throws; worst case is [].
+  window.RTWebhookOptions = function () {
+    try {
+      return endpoints().map(function (ep) { return { id: ep.id, label: ep.label }; });
+    } catch (e) { return []; }
+  };
+
+  // retry anything stranded by a previous session
+  try {
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', function () { flush(); });
+    } else { flush(); }
+  } catch (e) { /* ignore */ }
+})();
+
+/* --- access.config.js --- */
+/* Resume Tailor - profile access rules (blacklist)
+ *
+ * Decides which tabs a profile may open, based on the name typed into
+ * Profile > Full Name. The check re-runs every time the profile is saved
+ * (which is on every keystroke, debounced by the app's autosave), so a
+ * blocked name takes effect immediately - no reload needed.
+ *
+ * This file is the editable source of truth for the list, but it is NO LONGER
+ * served on its own - it is baked into the app bundle so it cannot be blocked
+ * by a request blocker. After editing, run:
+ *
+ *     node embed-access.mjs && node stamp-cache-version.mjs
+ *
+ * Editing it through GitHub's web UI alone will NOT change the live page.
+ *
+ * Names are stored as SALTED HASHES, not as text, so nobody can read the list
+ * out of this file or out of devtools. Add one with:
+ *
+ *     node hash-name.mjs "Some Name"
+ *
+ * and paste the line it prints into `blocklist` below. To check your work:
+ *
+ *     node hash-name.mjs --check "Some Name"
+ *
+ * WHAT THIS IS NOT: hashing hides the names from a casual reader. It is not
+ * encryption and it is not a secret - the salt and the algorithm are served to
+ * every visitor, so anyone willing to run a list of common first names through
+ * them will recover a match. And the whole guard is browser-side: it keeps a
+ * tab out of the UI, it does not protect anything behind that tab.
+ */
+window.RT_ACCESS_CONFIG = {
+  // Master switch. false disables all blocking (every tab stays open).
+  enabled: true,
+
+  // Console logging when a profile is blocked or unblocked. Never logs the
+  // name itself. false to quieten it.
+  log: true,
+
+  /* Which tabs to hide when the profile name matches. Tab ids are the keys of
+     the app's nav: 'home', 'profile', 'preview', 'about', 'contact'.
+     A blocked tab disappears from the nav bar, and if it is the tab currently
+     open the app falls back to `fallbackTab` below. Never block 'profile' -
+     that is the only place the name can be corrected. */
+  blockedTabs: ['preview'],
+
+  // Where to send someone who is sitting on a tab that just became blocked.
+  fallbackTab: 'home',
+
+  /* Make Profile > Integrations > Webhook a precondition for generating. With
+     this on, `blockedTabs` stays hidden until the profile points at an endpoint
+     that webhook.config.js still lists - so a profile that sends no events
+     cannot produce a resume. Selecting "None", or keeping an id that has since
+     been removed from webhook.config.js, both count as unset.
+
+     The Profile tab marks the dropdown required while this is on.
+
+     Safety valve: if webhook.config.js offers no usable endpoint at all, no
+     profile could ever satisfy this, so the rule is ignored (with a console
+     warning) rather than locking everyone out. */
+  requireWebhook: true,
+
+  /* Default matching rule, applied to every entry in `blocklist` that does not
+     override it:
+       'startsWith' - the name begins with the entry ("Alex" blocks
+                      "Alex Carter", but not "Jo Alex")
+       'exact'      - the whole name equals the entry
+       'contains'   - the entry appears anywhere in the name
+     Leading/trailing spaces are always ignored. */
+  match: 'startsWith',
+
+  // false (the default) matches regardless of capitalisation.
+  caseSensitive: false,
+
+  /* Salt mixed into every hash. Its only job is to make these digests specific
+     to this deployment, so a generic rainbow table does not apply. Generate one
+     with `node hash-name.mjs --new-salt`.
+
+     CHANGING THE SALT, `hashIterations` OR `caseSensitive` INVALIDATES EVERY
+     ENTRY BELOW - regenerate all of them if you touch any of the three. */
+  salt: 'IWMS9jOzHW3TwIEj6_IZIO0NfocOXNxe',
+
+  /* How many times to re-hash. Higher costs a brute-forcer more, and costs the
+     page a little on each keystroke (results are cached, so in practice only
+     the first check of a name is paid for). 1000 is a sane default; it does not
+     make the list secret, only slower to attack. */
+  hashIterations: 1000,
+
+  /* The blacklist. Each entry is either:
+   *
+   *   { hash: '<digest>', len: 6 }              - the normal case, from
+   *                                               `node hash-name.mjs "Name"`
+   *   { hash: '...', len: 6, match: 'exact' }   - overrides the default rule
+   *   { hash: '...', len: 6, note: 'why' }      - `note` is for humans only;
+   *                                               keep it free of the name
+   *   'PlainName'                               - still accepted, but READABLE
+   *                                               by anyone viewing source
+   *
+   * `len` is the character count of the hashed name. It lets the page check an
+   * entry with a single hash instead of one per prefix, and it is required for
+   * `match: 'contains'`. hash-name.mjs prints it for you.
+   *
+   * To add someone, append a line. To let someone back in, delete their line
+   * (or comment it out with //).
+   */
+  blocklist: [
+    { hash: '1636710ea5314db5c81c2fbdbf0c5376deb44c0ffa70eda0a919a8f9d45517f9', len: 11, note: 'C1' },
+    { hash: '7ea6098d47b3e7f49db08584ee72e781e0ff54cc4b2ee83aa0056f4cd6d4673c', len: 10, note: 'C2 - variant spelling of C1' },
+    { hash: '36b87d7999c9e97bb0dfba1c6b6b5574f565db6e0e7f1431508c6cfcb2ad6d30', len:  6, note: 'D1' },
+    { hash: 'eee878c2e83b5bc7e3a44c392d9e7809f8ffff44a7b11bdf645161e4f4e4ca61', len:  8, note: 'S1' },
+    { hash: 'c2455df4d65dec74a3f5e18ce7e79848c1ec3c30846d1a956be517845ac65497', len:  7, note: 'I1' },
+    { hash: '1e7fcf934aafd5cdcc703ca6d0763225fc4d28d30467ce7b6f360f4f7a9e6e2c', len:  6, note: 'A1' },
+    { hash: '0eec0c0a20e9cd34fc80819c810c93798cabd34a2ef2b9b9b181849987956602', len:  5, note: 'J1' },
+    { hash: 'eb3875675f6fc860bff7857546fd1383d315dcc43c0e637981a718ded83c2dbf', len:  5, note: 'Q1' },
+    { hash: '29480caf52613aa246eb58aea82e09c2275638cae16be9c439d8b20d8676fae9', len:  5, note: 'E1' },
+    { hash: 'dd197fef481c2a6b9476d42978caa6a3f38c33b71f0ca979caa40f29de64ad20', len: 10, note: 'K1 - full name, not just the first name' }
+  ],
+
+  /* Shown on the page in place of a blocked tab's content, if the app ever
+     renders it before navigating away. Keep these short. `message` is the
+     fallback for a reason with no entry in `messages`. */
+  messages: {
+    blocklist: 'This profile does not have access to the Preview tab.',
+    webhook: 'Choose a webhook under Profile > Integrations to unlock the Preview tab.'
+  },
+  message: 'This profile does not have access to the Preview tab.'
+};
+
+/* --- access.js --- */
+/* Resume Tailor - profile access guard
+ *
+ * Embedded into the top of the app bundle by embed-access.mjs, together with
+ * webhook.js and both config files - it is not served as its own <script> any
+ * more, because a blocked request used to disable it. Edit this file, then run
+ * `node embed-access.mjs && node stamp-cache-version.mjs`.
+ *
+ * Reads the rules in access.config.js and answers one question: given the
+ * profile as it stands, which tabs should be hidden?
+ *
+ * Two things can hide a tab:
+ *   blocklist - the name matches an entry in access.config.js
+ *   webhook   - `requireWebhook` is on and Profile > Integrations > Webhook is
+ *               unset, or points at an id webhook.config.js no longer lists
+ *
+ * Exposes:
+ *
+ *   window.RTAccess.setProfile(profile)  - called by the bundle whenever the
+ *                                          profile is saved (every autosave)
+ *   window.RTAccess.blockedTabs()        - ['preview'] etc, or [] when allowed
+ *   window.RTAccess.isBlockedTab(id)     - convenience for one tab id
+ *   window.RTAccess.reason()             - 'blocklist' | 'webhook' | null
+ *   window.RTAccess.requiresWebhook()    - is a webhook a precondition here?
+ *   window.RTAccess.hasWebhook()         - does the profile satisfy it?
+ *   window.RTAccess.isBlocked(name)      - the raw name test, for any caller
+ *   window.RTAccess.fallbackTab()        - tab to fall back to when kicked out
+ *   window.RTAccess.message(reason)      - text to show in a blocked tab
+ *   window.RTAccess.hash(name)           - { hash, len } to paste into the
+ *                                          config; see hash-name.mjs
+ *
+ * When the answer changes it also bubbles a DOM event from <html>, so the app
+ * (or anything else on the page) can react without polling:
+ *
+ *   document.addEventListener('resume-tailor:access-changed', e => {
+ *     e.detail.blockedTabs  // string[]
+ *     e.detail.reason       // 'blocklist' | 'webhook' | null
+ *   });
+ *
+ * The profile name never leaves the page - this file makes no requests.
+ *
+ * ON THE HASHES: blocklist entries are stored as salted SHA-256 digests so the
+ * names are not readable in this repo or in devtools. That is obfuscation, not
+ * secrecy - the salt and the algorithm ship with the page, so anyone willing to
+ * run a list of common names through them can recover a match. It stops casual
+ * reading. It does not keep a secret, and, like any browser-side guard, it does
+ * not stop someone determined to reach the code behind the tab.
+ */
+(function () {
+  'use strict';
+
+  var EVENT = 'resume-tailor:access-changed';
+  var PROFILE_KEY = 'resume-tailor:profile';
+  var LOG_PREFIX = '[resume-tailor]';
+  var TABS = { home: 1, profile: 1, preview: 1, about: 1, contact: 1 };
+  var MATCHERS = { startsWith: 1, exact: 1, contains: 1 };
+  var MAX_NAME = 120;     // longer input is truncated before hashing
+  var MAX_CACHE = 512;
+
+  var currentProfile = { name: '', webhookId: '' };
+  var currentTabs = [];
+  var currentReason = null;
+  var warned = {};
+
+  function warnOnce(key, msg, extra) {
+    if (warned[key]) return;
+    warned[key] = true;
+    try { console.warn(LOG_PREFIX, msg, extra === undefined ? '' : extra); } catch (e) { /* ignore */ }
+  }
+
+  /* The config as written, even when disabled - hash() must keep working so a
+     new entry can be generated with blocking switched off. */
+  function rawCfg() {
+    var c = window.RT_ACCESS_CONFIG;
+    return c && typeof c === 'object' ? c : {};
+  }
+
+  function cfg() {
+    var c = rawCfg();
+    return c.enabled === false ? null : c;
+  }
+
+  function log() {
+    if (rawCfg().log === false) return;
+    try { console.log.apply(console, arguments); } catch (e) { /* no console */ }
+  }
+
+  function str(v) { return typeof v === 'string' ? v.trim() : ''; }
+
+  /* Runs of whitespace collapse to one space, so a multi-word entry still
+     matches "Ada  Lovelace" or a name pasted with a tab in it. Single-word
+     entries hash identically either way, so this does not invalidate them. */
+  function fold(s, caseSensitive) {
+    s = str(s).replace(/\s+/g, ' ');
+    return caseSensitive ? s : s.toLowerCase();
+  }
+
+  /* ---------------------------------------------------------- sha-256 --- */
+  /* Plain synchronous SHA-256. WebCrypto is async, and the name check runs
+     inside a React render, which cannot wait for a promise. */
+
+  var K = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+  ];
+
+  function rotr(x, n) { return (x >>> n) | (x << (32 - n)); }
+
+  function utf8(s) {
+    var out = [], i, c, c2, cp;
+    for (i = 0; i < s.length; i++) {
+      c = s.charCodeAt(i);
+      if (c < 0x80) out.push(c);
+      else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+      else if (c >= 0xd800 && c < 0xdc00 && i + 1 < s.length) {
+        c2 = s.charCodeAt(i + 1);
+        cp = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
+        i++;
+        out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 63), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63));
+      } else out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+    }
+    return out;
+  }
+
+  function sha256(bytes) {
+    var H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+    var bits = bytes.length * 8;
+    var m = bytes.slice();
+    m.push(0x80);
+    while (m.length % 64 !== 56) m.push(0);
+    m.push(0, 0, 0, 0, (bits >>> 24) & 255, (bits >>> 16) & 255, (bits >>> 8) & 255, bits & 255);
+
+    var w = new Array(64), i, t, a, b, c, d, e, f, g, h, s0, s1, S0, S1, ch, maj, t1, t2;
+    for (i = 0; i < m.length; i += 64) {
+      for (t = 0; t < 16; t++) {
+        w[t] = (m[i + 4 * t] << 24) | (m[i + 4 * t + 1] << 16) | (m[i + 4 * t + 2] << 8) | m[i + 4 * t + 3];
+      }
+      for (t = 16; t < 64; t++) {
+        s0 = rotr(w[t - 15], 7) ^ rotr(w[t - 15], 18) ^ (w[t - 15] >>> 3);
+        s1 = rotr(w[t - 2], 17) ^ rotr(w[t - 2], 19) ^ (w[t - 2] >>> 10);
+        w[t] = (w[t - 16] + s0 + w[t - 7] + s1) | 0;
+      }
+      a = H[0]; b = H[1]; c = H[2]; d = H[3]; e = H[4]; f = H[5]; g = H[6]; h = H[7];
+      for (t = 0; t < 64; t++) {
+        S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+        ch = (e & f) ^ (~e & g);
+        t1 = (h + S1 + ch + K[t] + w[t]) | 0;
+        S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+        maj = (a & b) ^ (a & c) ^ (b & c);
+        t2 = (S0 + maj) | 0;
+        h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+      }
+      H[0] = (H[0] + a) | 0; H[1] = (H[1] + b) | 0; H[2] = (H[2] + c) | 0; H[3] = (H[3] + d) | 0;
+      H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;
+    }
+    var out = [];
+    for (i = 0; i < 8; i++) out.push((H[i] >>> 24) & 255, (H[i] >>> 16) & 255, (H[i] >>> 8) & 255, H[i] & 255);
+    return out;
+  }
+
+  function hex(bytes) {
+    var s = '';
+    for (var i = 0; i < bytes.length; i++) s += (bytes[i] < 16 ? '0' : '') + bytes[i].toString(16);
+    return s;
+  }
+
+  /* Typing re-hashes the same prefixes over and over, so memoise. Keyed by the
+     settings too, so editing the config from a console still behaves. */
+  var cache = Object.create(null);
+  var cacheN = 0;
+
+  function digest(value) {
+    var c = rawCfg();
+    var salt = str(c.salt);
+    var iter = typeof c.hashIterations === 'number' && c.hashIterations > 0 ? (c.hashIterations | 0) : 1;
+    var key = iter + '\u001f' + salt + '\u001f' + value;
+
+    if (cache[key] !== undefined) return cache[key];
+    var b = sha256(utf8(salt + '\u001f' + value));
+    for (var i = 1; i < iter; i++) b = sha256(b);
+    var out = hex(b);
+
+    if (cacheN >= MAX_CACHE) { cache = Object.create(null); cacheN = 0; }
+    cache[key] = out;
+    cacheN++;
+    return out;
+  }
+
+  /* --------------------------------------------------------- matching --- */
+
+  function defaultMatch() {
+    var c = cfg();
+    var m = str(c && c.match) || 'startsWith';
+    if (!MATCHERS[m]) {
+      warnOnce('match-' + m, 'access.config.js has unknown match "' + m + '" (expected startsWith, exact or contains); using startsWith');
+      return 'startsWith';
+    }
+    return m;
+  }
+
+  function hitPlain(subject, needle, mode) {
+    if (mode === 'exact') return subject === needle;
+    if (mode === 'contains') return subject.indexOf(needle) !== -1;
+    return subject.indexOf(needle) === 0;
+  }
+
+  /* `len` is the length of the hashed name. Recording it keeps this to one hash
+     per entry instead of one per prefix; without it we have to scan. */
+  function hitHash(subject, hash, len, mode, i) {
+    var s;
+    if (len > 0) {
+      if (len > subject.length) return false;
+      if (mode === 'exact') return len === subject.length && digest(subject) === hash;
+      if (mode === 'startsWith') return digest(subject.slice(0, len)) === hash;
+      for (s = 0; s + len <= subject.length; s++) if (digest(subject.substr(s, len)) === hash) return true;
+      return false;
+    }
+    if (mode === 'exact') return digest(subject) === hash;
+    if (mode === 'startsWith') {
+      for (s = 1; s <= subject.length; s++) if (digest(subject.slice(0, s)) === hash) return true;
+      return false;
+    }
+    warnOnce('hash-contains-' + i, 'access.config.js blocklist entry #' + (i + 1) + ' uses match "contains" with a hash but no len, so it cannot be checked; add len (hash-name.mjs prints it) or use startsWith. Entry skipped');
+    return false;
+  }
+
+  /* True when `name` is on the blacklist. Safe to call with anything. */
+  function isBlocked(name) {
+    var c = cfg();
+    if (!c) return false;
+
+    var caseSensitive = c.caseSensitive === true;
+    var subject = fold(name, caseSensitive);
+    if (!subject) return false;
+    if (subject.length > MAX_NAME) subject = subject.slice(0, MAX_NAME);
+
+    var list = Array.isArray(c.blocklist) ? c.blocklist : [];
+    var fallback = defaultMatch();
+
+    for (var i = 0; i < list.length; i++) {
+      var entry = list[i], mode = fallback, plain = '', hash = '', len = -1, m;
+
+      if (entry && typeof entry === 'object') {
+        if (entry.match !== undefined) {
+          m = str(entry.match);
+          if (MATCHERS[m]) mode = m;
+          else warnOnce('emm-' + i, 'access.config.js blocklist entry #' + (i + 1) + ' has unknown match "' + m + '"; using ' + fallback);
+        }
+        if (str(entry.hash)) {
+          hash = str(entry.hash).toLowerCase();
+          if (typeof entry.len === 'number' && entry.len > 0) len = entry.len | 0;
+        } else {
+          plain = fold(entry.value, caseSensitive);
+        }
+      } else {
+        plain = fold(entry, caseSensitive);
+      }
+
+      if (hash) { if (hitHash(subject, hash, len, mode, i)) return true; }
+      else if (plain) { if (hitPlain(subject, plain, mode)) return true; }
+      else warnOnce('empty-' + i, 'access.config.js blocklist entry #' + (i + 1) + ' has neither value nor hash; skipped');
+    }
+    return false;
+  }
+
+  /* --------------------------------------------------- webhook rule --- */
+  /* `requireWebhook` makes the Profile > Integrations > Webhook dropdown a
+     precondition: until it points at an endpoint that webhook.config.js still
+     lists, the profile is treated exactly like a blocked one. */
+
+  function webhookOptions() {
+    try {
+      var o = window.RTWebhookOptions && window.RTWebhookOptions();
+      return Array.isArray(o) ? o : [];
+    } catch (e) { return []; }
+  }
+
+  function requiresWebhook() {
+    var c = cfg();
+    if (!c || c.requireWebhook !== true) return false;
+    /* No endpoints to pick from means no profile could ever satisfy the rule,
+       which would lock everyone out of the app. Refuse to enforce it. */
+    if (webhookOptions().length === 0) {
+      warnOnce('rw-empty', 'access.config.js sets requireWebhook: true, but webhook.config.js offers no usable endpoint, so no profile could ever satisfy it. The requirement is ignored until at least one endpoint exists.');
+      return false;
+    }
+    return true;
+  }
+
+  function hasWebhook(id) {
+    id = str(id);
+    if (!id) return false;
+    var o = webhookOptions();
+    for (var i = 0; i < o.length; i++) if (o[i] && o[i].id === id) return true;
+    return false;   // selected, but no longer listed in webhook.config.js
+  }
+
+  /* 'blocklist', 'webhook', or null when the profile is fine. */
+  function reasonFor(p) {
+    if (!cfg()) return null;
+    if (isBlocked(p.name)) return 'blocklist';
+    if (requiresWebhook() && !hasWebhook(p.webhookId)) return 'webhook';
+    return null;
+  }
+
+  /* --------------------------------------------------------- the tabs --- */
+
+  function configuredTabs() {
+    var c = cfg();
+    var list = c && Array.isArray(c.blockedTabs) ? c.blockedTabs : ['preview'];
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      var id = str(list[i]);
+      if (!id) continue;
+      if (!TABS[id]) { warnOnce('tab-' + id, 'access.config.js blockedTabs has unknown tab "' + id + '" (expected ' + Object.keys(TABS).join(', ') + '); ignored'); continue; }
+      if (out.indexOf(id) === -1) out.push(id);
+    }
+    return out;
+  }
+
+  function fallbackTab() {
+    var c = cfg();
+    var id = str(c && c.fallbackTab) || 'home';
+    return TABS[id] ? id : 'home';
+  }
+
+  /* `reason` defaults to why the current profile is blocked. */
+  function message(reason) {
+    var c = cfg() || {};
+    var m = c.messages && typeof c.messages === 'object' ? c.messages : {};
+    var why = reason === undefined ? currentReason : reason;
+    return str(m[why]) || str(c.message) || 'This profile does not have access to this tab.';
+  }
+
+  function tabsFor(p) {
+    return reasonFor(p) ? configuredTabs() : [];
+  }
+
+  function same(a, b) {
+    if (a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+
+  /* Recompute from `currentName`; announce only when the answer moved. The name
+     is deliberately kept out of the log line and the event detail. */
+  function refresh() {
+    var why = reasonFor(currentProfile);
+    var next = why ? configuredTabs() : [];
+    if (same(next, currentTabs) && why === currentReason) return currentTabs;
+
+    var was = currentTabs;
+    currentTabs = next;
+    currentReason = why;
+
+    if (next.length) log(LOG_PREFIX, 'this profile is blocked from: ' + next.join(', ') + ' (' + why + ')');
+    else if (was.length) log(LOG_PREFIX, 'this profile is no longer blocked');
+
+    try {
+      document.documentElement.dispatchEvent(new CustomEvent(EVENT, {
+        bubbles: true,
+        detail: { blockedTabs: next.slice(), reason: why }
+      }));
+    } catch (e) { /* very old browser - the app still reads blockedTabs() on mount */ }
+
+    return currentTabs;
+  }
+
+  function setProfile(profile) {
+    currentProfile = profile && typeof profile === 'object'
+      ? { name: str(profile.fullName), webhookId: str(profile.webhookId) }
+      : { name: str(profile), webhookId: '' };
+    return refresh();
+  }
+
+  /* Seed from whatever was saved last session, so a blocked profile is blocked
+     on the very first render rather than after the first keystroke. */
+  function boot() {
+    try {
+      var raw = localStorage.getItem(PROFILE_KEY);
+      if (raw) {
+        var saved = JSON.parse(raw);
+        currentProfile = { name: str(saved.fullName), webhookId: str(saved.webhookId) };
+      }
+    } catch (e) { /* no storage, or not JSON - treat as no profile */ }
+    currentReason = reasonFor(currentProfile);
+    currentTabs = currentReason ? configuredTabs() : [];
+    if (currentTabs.length) log(LOG_PREFIX, 'this profile is blocked from: ' + currentTabs.join(', ') + ' (' + currentReason + ')');
+  }
+
+  boot();
+
+  var API = {
+    setProfile: setProfile,
+    blockedTabs: function () { return currentTabs.slice(); },
+    isBlockedTab: function (id) { return currentTabs.indexOf(str(id)) !== -1; },
+    isBlocked: isBlocked,
+    fallbackTab: fallbackTab,
+    message: message,
+    refresh: refresh,
+    event: EVENT,
+    /* Why the current profile is blocked: 'blocklist', 'webhook' or null. */
+    reason: function () { return currentReason; },
+    /* Is a webhook currently a precondition for generating? False when the rule
+       is off, or when webhook.config.js lists nothing to pick. */
+    requiresWebhook: requiresWebhook,
+    /* Does the current profile point at an endpoint that still exists? */
+    hasWebhook: function () { return hasWebhook(currentProfile.webhookId); },
+    /* Turn a name into the { hash, len } pair that goes in the config. Uses the
+       salt / hashIterations / caseSensitive currently loaded, so every entry has
+       to be regenerated if you change any of those. */
+    hash: function (name) {
+      var v = fold(name, rawCfg().caseSensitive === true);
+      return { hash: digest(v), len: v.length };
+    }
+  };
+
+  /* Non-writable so `RTAccess = {blockedTabs:()=>[]}` typed into a console does
+     not swap the guard out. Anyone who can edit the bundle still can, of course.
+     The fallback covers a browser that refuses defineProperty, and the inner
+     catch covers this file somehow running twice. */
+  try {
+    Object.defineProperty(window, 'RTAccess', {
+      value: API, writable: false, configurable: false, enumerable: true
+    });
+  } catch (e) {
+    try { window.RTAccess = API; } catch (e2) { /* already locked - fine */ }
+  }
+})();
+
+})();/*RT_ACCESS_EMBED_END*/
 var e=Object.create,t=Object.defineProperty,n=Object.getOwnPropertyDescriptor,r=Object.getOwnPropertyNames,i=Object.getPrototypeOf,a=Object.prototype.hasOwnProperty,o=(e,t)=>()=>(t||e((t={exports:{}}).exports,t),t.exports),s=(e,i,o,s)=>{if(i&&typeof i==`object`||typeof i==`function`)for(var c=r(i),l=0,u=c.length,d;l<u;l++)d=c[l],!a.call(e,d)&&d!==o&&t(e,d,{get:(e=>i[e]).bind(null,d),enumerable:!(s=n(i,d))||s.enumerable});return e},c=(n,r,a)=>(a=n==null?{}:e(i(n)),s(r||!n||!n.__esModule?t(a,`default`,{value:n,enumerable:!0}):a,n));(function(){let e=document.createElement(`link`).relList;if(e&&e.supports&&e.supports(`modulepreload`))return;for(let e of document.querySelectorAll(`link[rel="modulepreload"]`))n(e);new MutationObserver(e=>{for(let t of e)if(t.type===`childList`)for(let e of t.addedNodes)e.tagName===`LINK`&&e.rel===`modulepreload`&&n(e)}).observe(document,{childList:!0,subtree:!0});function t(e){let t={};return e.integrity&&(t.integrity=e.integrity),e.referrerPolicy&&(t.referrerPolicy=e.referrerPolicy),e.crossOrigin===`use-credentials`?t.credentials=`include`:e.crossOrigin===`anonymous`?t.credentials=`omit`:t.credentials=`same-origin`,t}function n(e){if(e.ep)return;e.ep=!0;let n=t(e);fetch(e.href,n)}})();var l=o((e=>{var t=Symbol.for(`react.transitional.element`),n=Symbol.for(`react.portal`),r=Symbol.for(`react.fragment`),i=Symbol.for(`react.strict_mode`),a=Symbol.for(`react.profiler`),o=Symbol.for(`react.consumer`),s=Symbol.for(`react.context`),c=Symbol.for(`react.forward_ref`),l=Symbol.for(`react.suspense`),u=Symbol.for(`react.memo`),d=Symbol.for(`react.lazy`),f=Symbol.for(`react.activity`),p=Symbol.iterator;function m(e){return typeof e!=`object`||!e?null:(e=p&&e[p]||e[`@@iterator`],typeof e==`function`?e:null)}var h={isMounted:function(){return!1},enqueueForceUpdate:function(){},enqueueReplaceState:function(){},enqueueSetState:function(){}},g=Object.assign,_={};function v(e,t,n){this.props=e,this.context=t,this.refs=_,this.updater=n||h}v.prototype.isReactComponent={},v.prototype.setState=function(e,t){if(typeof e!=`object`&&typeof e!=`function`&&e!=null)throw Error(`takes an object of state variables to update or a function which returns an object of state variables.`);this.updater.enqueueSetState(this,e,t,`setState`)},v.prototype.forceUpdate=function(e){this.updater.enqueueForceUpdate(this,e,`forceUpdate`)};function y(){}y.prototype=v.prototype;function b(e,t,n){this.props=e,this.context=t,this.refs=_,this.updater=n||h}var x=b.prototype=new y;x.constructor=b,g(x,v.prototype),x.isPureReactComponent=!0;var S=Array.isArray;function C(){}var w={H:null,A:null,T:null,S:null},T=Object.prototype.hasOwnProperty;function E(e,n,r){var i=r.ref;return{$$typeof:t,type:e,key:n,ref:i===void 0?null:i,props:r}}function D(e,t){return E(e.type,t,e.props)}function O(e){return typeof e==`object`&&!!e&&e.$$typeof===t}function k(e){var t={"=":`=0`,":":`=2`};return`$`+e.replace(/[=:]/g,function(e){return t[e]})}var A=/\/+/g;function j(e,t){return typeof e==`object`&&e&&e.key!=null?k(``+e.key):t.toString(36)}function M(e){switch(e.status){case`fulfilled`:return e.value;case`rejected`:throw e.reason;default:switch(typeof e.status==`string`?e.then(C,C):(e.status=`pending`,e.then(function(t){e.status===`pending`&&(e.status=`fulfilled`,e.value=t)},function(t){e.status===`pending`&&(e.status=`rejected`,e.reason=t)})),e.status){case`fulfilled`:return e.value;case`rejected`:throw e.reason}}throw e}function N(e,r,i,a,o){var s=typeof e;(s===`undefined`||s===`boolean`)&&(e=null);var c=!1;if(e===null)c=!0;else switch(s){case`bigint`:case`string`:case`number`:c=!0;break;case`object`:switch(e.$$typeof){case t:case n:c=!0;break;case d:return c=e._init,N(c(e._payload),r,i,a,o)}}if(c)return o=o(e),c=a===``?`.`+j(e,0):a,S(o)?(i=``,c!=null&&(i=c.replace(A,`$&/`)+`/`),N(o,r,i,``,function(e){return e})):o!=null&&(O(o)&&(o=D(o,i+(o.key==null||e&&e.key===o.key?``:(``+o.key).replace(A,`$&/`)+`/`)+c)),r.push(o)),1;c=0;var l=a===``?`.`:a+`:`;if(S(e))for(var u=0;u<e.length;u++)a=e[u],s=l+j(a,u),c+=N(a,r,i,s,o);else if(u=m(e),typeof u==`function`)for(e=u.call(e),u=0;!(a=e.next()).done;)a=a.value,s=l+j(a,u++),c+=N(a,r,i,s,o);else if(s===`object`){if(typeof e.then==`function`)return N(M(e),r,i,a,o);throw r=String(e),Error(`Objects are not valid as a React child (found: `+(r===`[object Object]`?`object with keys {`+Object.keys(e).join(`, `)+`}`:r)+`). If you meant to render a collection of children, use an array instead.`)}return c}function P(e,t,n){if(e==null)return e;var r=[],i=0;return N(e,r,``,``,function(e){return t.call(n,e,i++)}),r}function F(e){if(e._status===-1){var t=e._result;t=t(),t.then(function(t){(e._status===0||e._status===-1)&&(e._status=1,e._result=t)},function(t){(e._status===0||e._status===-1)&&(e._status=2,e._result=t)}),e._status===-1&&(e._status=0,e._result=t)}if(e._status===1)return e._result.default;throw e._result}var I=typeof reportError==`function`?reportError:function(e){if(typeof window==`object`&&typeof window.ErrorEvent==`function`){var t=new window.ErrorEvent(`error`,{bubbles:!0,cancelable:!0,message:typeof e==`object`&&e&&typeof e.message==`string`?String(e.message):String(e),error:e});if(!window.dispatchEvent(t))return}else if(typeof process==`object`&&typeof process.emit==`function`){process.emit(`uncaughtException`,e);return}console.error(e)},L={map:P,forEach:function(e,t,n){P(e,function(){t.apply(this,arguments)},n)},count:function(e){var t=0;return P(e,function(){t++}),t},toArray:function(e){return P(e,function(e){return e})||[]},only:function(e){if(!O(e))throw Error(`React.Children.only expected to receive a single React element child.`);return e}};e.Activity=f,e.Children=L,e.Component=v,e.Fragment=r,e.Profiler=a,e.PureComponent=b,e.StrictMode=i,e.Suspense=l,e.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE=w,e.__COMPILER_RUNTIME={__proto__:null,c:function(e){return w.H.useMemoCache(e)}},e.cache=function(e){return function(){return e.apply(null,arguments)}},e.cacheSignal=function(){return null},e.cloneElement=function(e,t,n){if(e==null)throw Error(`The argument must be a React element, but you passed `+e+`.`);var r=g({},e.props),i=e.key;if(t!=null)for(a in t.key!==void 0&&(i=``+t.key),t)!T.call(t,a)||a===`key`||a===`__self`||a===`__source`||a===`ref`&&t.ref===void 0||(r[a]=t[a]);var a=arguments.length-2;if(a===1)r.children=n;else if(1<a){for(var o=Array(a),s=0;s<a;s++)o[s]=arguments[s+2];r.children=o}return E(e.type,i,r)},e.createContext=function(e){return e={$$typeof:s,_currentValue:e,_currentValue2:e,_threadCount:0,Provider:null,Consumer:null},e.Provider=e,e.Consumer={$$typeof:o,_context:e},e},e.createElement=function(e,t,n){var r,i={},a=null;if(t!=null)for(r in t.key!==void 0&&(a=``+t.key),t)T.call(t,r)&&r!==`key`&&r!==`__self`&&r!==`__source`&&(i[r]=t[r]);var o=arguments.length-2;if(o===1)i.children=n;else if(1<o){for(var s=Array(o),c=0;c<o;c++)s[c]=arguments[c+2];i.children=s}if(e&&e.defaultProps)for(r in o=e.defaultProps,o)i[r]===void 0&&(i[r]=o[r]);return E(e,a,i)},e.createRef=function(){return{current:null}},e.forwardRef=function(e){return{$$typeof:c,render:e}},e.isValidElement=O,e.lazy=function(e){return{$$typeof:d,_payload:{_status:-1,_result:e},_init:F}},e.memo=function(e,t){return{$$typeof:u,type:e,compare:t===void 0?null:t}},e.startTransition=function(e){var t=w.T,n={};w.T=n;try{var r=e(),i=w.S;i!==null&&i(n,r),typeof r==`object`&&r&&typeof r.then==`function`&&r.then(C,I)}catch(e){I(e)}finally{t!==null&&n.types!==null&&(t.types=n.types),w.T=t}},e.unstable_useCacheRefresh=function(){return w.H.useCacheRefresh()},e.use=function(e){return w.H.use(e)},e.useActionState=function(e,t,n){return w.H.useActionState(e,t,n)},e.useCallback=function(e,t){return w.H.useCallback(e,t)},e.useContext=function(e){return w.H.useContext(e)},e.useDebugValue=function(){},e.useDeferredValue=function(e,t){return w.H.useDeferredValue(e,t)},e.useEffect=function(e,t){return w.H.useEffect(e,t)},e.useEffectEvent=function(e){return w.H.useEffectEvent(e)},e.useId=function(){return w.H.useId()},e.useImperativeHandle=function(e,t,n){return w.H.useImperativeHandle(e,t,n)},e.useInsertionEffect=function(e,t){return w.H.useInsertionEffect(e,t)},e.useLayoutEffect=function(e,t){return w.H.useLayoutEffect(e,t)},e.useMemo=function(e,t){return w.H.useMemo(e,t)},e.useOptimistic=function(e,t){return w.H.useOptimistic(e,t)},e.useReducer=function(e,t,n){return w.H.useReducer(e,t,n)},e.useRef=function(e){return w.H.useRef(e)},e.useState=function(e){return w.H.useState(e)},e.useSyncExternalStore=function(e,t,n){return w.H.useSyncExternalStore(e,t,n)},e.useTransition=function(){return w.H.useTransition()},e.version=`19.2.4`})),u=o(((e,t)=>{t.exports=l()})),d=o((e=>{function t(e,t){var n=e.length;e.push(t);a:for(;0<n;){var r=n-1>>>1,a=e[r];if(0<i(a,t))e[r]=t,e[n]=a,n=r;else break a}}function n(e){return e.length===0?null:e[0]}function r(e){if(e.length===0)return null;var t=e[0],n=e.pop();if(n!==t){e[0]=n;a:for(var r=0,a=e.length,o=a>>>1;r<o;){var s=2*(r+1)-1,c=e[s],l=s+1,u=e[l];if(0>i(c,n))l<a&&0>i(u,c)?(e[r]=u,e[l]=n,r=l):(e[r]=c,e[s]=n,r=s);else if(l<a&&0>i(u,n))e[r]=u,e[l]=n,r=l;else break a}}return t}function i(e,t){var n=e.sortIndex-t.sortIndex;return n===0?e.id-t.id:n}if(e.unstable_now=void 0,typeof performance==`object`&&typeof performance.now==`function`){var a=performance;e.unstable_now=function(){return a.now()}}else{var o=Date,s=o.now();e.unstable_now=function(){return o.now()-s}}var c=[],l=[],u=1,d=null,f=3,p=!1,m=!1,h=!1,g=!1,_=typeof setTimeout==`function`?setTimeout:null,v=typeof clearTimeout==`function`?clearTimeout:null,y=typeof setImmediate<`u`?setImmediate:null;function b(e){for(var i=n(l);i!==null;){if(i.callback===null)r(l);else if(i.startTime<=e)r(l),i.sortIndex=i.expirationTime,t(c,i);else break;i=n(l)}}function x(e){if(h=!1,b(e),!m)if(n(c)!==null)m=!0,S||(S=!0,O());else{var t=n(l);t!==null&&j(x,t.startTime-e)}}var S=!1,C=-1,w=5,T=-1;function E(){return g?!0:!(e.unstable_now()-T<w)}function D(){if(g=!1,S){var t=e.unstable_now();T=t;var i=!0;try{a:{m=!1,h&&(h=!1,v(C),C=-1),p=!0;var a=f;try{b:{for(b(t),d=n(c);d!==null&&!(d.expirationTime>t&&E());){var o=d.callback;if(typeof o==`function`){d.callback=null,f=d.priorityLevel;var s=o(d.expirationTime<=t);if(t=e.unstable_now(),typeof s==`function`){d.callback=s,b(t),i=!0;break b}d===n(c)&&r(c),b(t)}else r(c);d=n(c)}if(d!==null)i=!0;else{var u=n(l);u!==null&&j(x,u.startTime-t),i=!1}}break a}finally{d=null,f=a,p=!1}i=void 0}}finally{i?O():S=!1}}}var O;if(typeof y==`function`)O=function(){y(D)};else if(typeof MessageChannel<`u`){var k=new MessageChannel,A=k.port2;k.port1.onmessage=D,O=function(){A.postMessage(null)}}else O=function(){_(D,0)};function j(t,n){C=_(function(){t(e.unstable_now())},n)}e.unstable_IdlePriority=5,e.unstable_ImmediatePriority=1,e.unstable_LowPriority=4,e.unstable_NormalPriority=3,e.unstable_Profiling=null,e.unstable_UserBlockingPriority=2,e.unstable_cancelCallback=function(e){e.callback=null},e.unstable_forceFrameRate=function(e){0>e||125<e?console.error(`forceFrameRate takes a positive int between 0 and 125, forcing frame rates higher than 125 fps is not supported`):w=0<e?Math.floor(1e3/e):5},e.unstable_getCurrentPriorityLevel=function(){return f},e.unstable_next=function(e){switch(f){case 1:case 2:case 3:var t=3;break;default:t=f}var n=f;f=t;try{return e()}finally{f=n}},e.unstable_requestPaint=function(){g=!0},e.unstable_runWithPriority=function(e,t){switch(e){case 1:case 2:case 3:case 4:case 5:break;default:e=3}var n=f;f=e;try{return t()}finally{f=n}},e.unstable_scheduleCallback=function(r,i,a){var o=e.unstable_now();switch(typeof a==`object`&&a?(a=a.delay,a=typeof a==`number`&&0<a?o+a:o):a=o,r){case 1:var s=-1;break;case 2:s=250;break;case 5:s=1073741823;break;case 4:s=1e4;break;default:s=5e3}return s=a+s,r={id:u++,callback:i,priorityLevel:r,startTime:a,expirationTime:s,sortIndex:-1},a>o?(r.sortIndex=a,t(l,r),n(c)===null&&r===n(l)&&(h?(v(C),C=-1):h=!0,j(x,a-o))):(r.sortIndex=s,t(c,r),m||p||(m=!0,S||(S=!0,O()))),r},e.unstable_shouldYield=E,e.unstable_wrapCallback=function(e){var t=f;return function(){var n=f;f=t;try{return e.apply(this,arguments)}finally{f=n}}}})),f=o(((e,t)=>{t.exports=d()})),p=o((e=>{var t=u();function n(e){var t=`https://react.dev/errors/`+e;if(1<arguments.length){t+=`?args[]=`+encodeURIComponent(arguments[1]);for(var n=2;n<arguments.length;n++)t+=`&args[]=`+encodeURIComponent(arguments[n])}return`Minified React error #`+e+`; visit `+t+` for the full message or use the non-minified dev environment for full errors and additional helpful warnings.`}function r(){}var i={d:{f:r,r:function(){throw Error(n(522))},D:r,C:r,L:r,m:r,X:r,S:r,M:r},p:0,findDOMNode:null},a=Symbol.for(`react.portal`);function o(e,t,n){var r=3<arguments.length&&arguments[3]!==void 0?arguments[3]:null;return{$$typeof:a,key:r==null?null:``+r,children:e,containerInfo:t,implementation:n}}var s=t.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE;function c(e,t){if(e===`font`)return``;if(typeof t==`string`)return t===`use-credentials`?t:``}e.__DOM_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE=i,e.createPortal=function(e,t){var r=2<arguments.length&&arguments[2]!==void 0?arguments[2]:null;if(!t||t.nodeType!==1&&t.nodeType!==9&&t.nodeType!==11)throw Error(n(299));return o(e,t,null,r)},e.flushSync=function(e){var t=s.T,n=i.p;try{if(s.T=null,i.p=2,e)return e()}finally{s.T=t,i.p=n,i.d.f()}},e.preconnect=function(e,t){typeof e==`string`&&(t?(t=t.crossOrigin,t=typeof t==`string`?t===`use-credentials`?t:``:void 0):t=null,i.d.C(e,t))},e.prefetchDNS=function(e){typeof e==`string`&&i.d.D(e)},e.preinit=function(e,t){if(typeof e==`string`&&t&&typeof t.as==`string`){var n=t.as,r=c(n,t.crossOrigin),a=typeof t.integrity==`string`?t.integrity:void 0,o=typeof t.fetchPriority==`string`?t.fetchPriority:void 0;n===`style`?i.d.S(e,typeof t.precedence==`string`?t.precedence:void 0,{crossOrigin:r,integrity:a,fetchPriority:o}):n===`script`&&i.d.X(e,{crossOrigin:r,integrity:a,fetchPriority:o,nonce:typeof t.nonce==`string`?t.nonce:void 0})}},e.preinitModule=function(e,t){if(typeof e==`string`)if(typeof t==`object`&&t){if(t.as==null||t.as===`script`){var n=c(t.as,t.crossOrigin);i.d.M(e,{crossOrigin:n,integrity:typeof t.integrity==`string`?t.integrity:void 0,nonce:typeof t.nonce==`string`?t.nonce:void 0})}}else t??i.d.M(e)},e.preload=function(e,t){if(typeof e==`string`&&typeof t==`object`&&t&&typeof t.as==`string`){var n=t.as,r=c(n,t.crossOrigin);i.d.L(e,n,{crossOrigin:r,integrity:typeof t.integrity==`string`?t.integrity:void 0,nonce:typeof t.nonce==`string`?t.nonce:void 0,type:typeof t.type==`string`?t.type:void 0,fetchPriority:typeof t.fetchPriority==`string`?t.fetchPriority:void 0,referrerPolicy:typeof t.referrerPolicy==`string`?t.referrerPolicy:void 0,imageSrcSet:typeof t.imageSrcSet==`string`?t.imageSrcSet:void 0,imageSizes:typeof t.imageSizes==`string`?t.imageSizes:void 0,media:typeof t.media==`string`?t.media:void 0})}},e.preloadModule=function(e,t){if(typeof e==`string`)if(t){var n=c(t.as,t.crossOrigin);i.d.m(e,{as:typeof t.as==`string`&&t.as!==`script`?t.as:void 0,crossOrigin:n,integrity:typeof t.integrity==`string`?t.integrity:void 0})}else i.d.m(e)},e.requestFormReset=function(e){i.d.r(e)},e.unstable_batchedUpdates=function(e,t){return e(t)},e.useFormState=function(e,t,n){return s.H.useFormState(e,t,n)},e.useFormStatus=function(){return s.H.useHostTransitionStatus()},e.version=`19.2.4`})),m=o(((e,t)=>{function n(){if(!(typeof __REACT_DEVTOOLS_GLOBAL_HOOK__>`u`||typeof __REACT_DEVTOOLS_GLOBAL_HOOK__.checkDCE!=`function`))try{__REACT_DEVTOOLS_GLOBAL_HOOK__.checkDCE(n)}catch(e){console.error(e)}}n(),t.exports=p()})),h=o((e=>{var t=f(),n=u(),r=m();function i(e){var t=`https://react.dev/errors/`+e;if(1<arguments.length){t+=`?args[]=`+encodeURIComponent(arguments[1]);for(var n=2;n<arguments.length;n++)t+=`&args[]=`+encodeURIComponent(arguments[n])}return`Minified React error #`+e+`; visit `+t+` for the full message or use the non-minified dev environment for full errors and additional helpful warnings.`}function a(e){return!(!e||e.nodeType!==1&&e.nodeType!==9&&e.nodeType!==11)}function o(e){var t=e,n=e;if(e.alternate)for(;t.return;)t=t.return;else{e=t;do t=e,t.flags&4098&&(n=t.return),e=t.return;while(e)}return t.tag===3?n:null}function s(e){if(e.tag===13){var t=e.memoizedState;if(t===null&&(e=e.alternate,e!==null&&(t=e.memoizedState)),t!==null)return t.dehydrated}return null}function c(e){if(e.tag===31){var t=e.memoizedState;if(t===null&&(e=e.alternate,e!==null&&(t=e.memoizedState)),t!==null)return t.dehydrated}return null}function l(e){if(o(e)!==e)throw Error(i(188))}function d(e){var t=e.alternate;if(!t){if(t=o(e),t===null)throw Error(i(188));return t===e?e:null}for(var n=e,r=t;;){var a=n.return;if(a===null)break;var s=a.alternate;if(s===null){if(r=a.return,r!==null){n=r;continue}break}if(a.child===s.child){for(s=a.child;s;){if(s===n)return l(a),e;if(s===r)return l(a),t;s=s.sibling}throw Error(i(188))}if(n.return!==r.return)n=a,r=s;else{for(var c=!1,u=a.child;u;){if(u===n){c=!0,n=a,r=s;break}if(u===r){c=!0,r=a,n=s;break}u=u.sibling}if(!c){for(u=s.child;u;){if(u===n){c=!0,n=s,r=a;break}if(u===r){c=!0,r=s,n=a;break}u=u.sibling}if(!c)throw Error(i(189))}}if(n.alternate!==r)throw Error(i(190))}if(n.tag!==3)throw Error(i(188));return n.stateNode.current===n?e:t}function p(e){var t=e.tag;if(t===5||t===26||t===27||t===6)return e;for(e=e.child;e!==null;){if(t=p(e),t!==null)return t;e=e.sibling}return null}var h=Object.assign,g=Symbol.for(`react.element`),_=Symbol.for(`react.transitional.element`),v=Symbol.for(`react.portal`),y=Symbol.for(`react.fragment`),b=Symbol.for(`react.strict_mode`),x=Symbol.for(`react.profiler`),S=Symbol.for(`react.consumer`),C=Symbol.for(`react.context`),w=Symbol.for(`react.forward_ref`),T=Symbol.for(`react.suspense`),E=Symbol.for(`react.suspense_list`),D=Symbol.for(`react.memo`),O=Symbol.for(`react.lazy`),k=Symbol.for(`react.activity`),A=Symbol.for(`react.memo_cache_sentinel`),j=Symbol.iterator;function M(e){return typeof e!=`object`||!e?null:(e=j&&e[j]||e[`@@iterator`],typeof e==`function`?e:null)}var N=Symbol.for(`react.client.reference`);function P(e){if(e==null)return null;if(typeof e==`function`)return e.$$typeof===N?null:e.displayName||e.name||null;if(typeof e==`string`)return e;switch(e){case y:return`Fragment`;case x:return`Profiler`;case b:return`StrictMode`;case T:return`Suspense`;case E:return`SuspenseList`;case k:return`Activity`}if(typeof e==`object`)switch(e.$$typeof){case v:return`Portal`;case C:return e.displayName||`Context`;case S:return(e._context.displayName||`Context`)+`.Consumer`;case w:var t=e.render;return e=e.displayName,e||=(e=t.displayName||t.name||``,e===``?`ForwardRef`:`ForwardRef(`+e+`)`),e;case D:return t=e.displayName||null,t===null?P(e.type)||`Memo`:t;case O:t=e._payload,e=e._init;try{return P(e(t))}catch{}}return null}var F=Array.isArray,I=n.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE,L=r.__DOM_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE,R={pending:!1,data:null,method:null,action:null},z=[],B=-1;function V(e){return{current:e}}function ee(e){0>B||(e.current=z[B],z[B]=null,B--)}function H(e,t){B++,z[B]=e.current,e.current=t}var U=V(null),W=V(null),G=V(null),te=V(null);function ne(e,t){switch(H(G,t),H(W,e),H(U,null),t.nodeType){case 9:case 11:e=(e=t.documentElement)&&(e=e.namespaceURI)?Vd(e):0;break;default:if(e=t.tagName,t=t.namespaceURI)t=Vd(t),e=Hd(t,e);else switch(e){case`svg`:e=1;break;case`math`:e=2;break;default:e=0}}ee(U),H(U,e)}function re(){ee(U),ee(W),ee(G)}function ie(e){e.memoizedState!==null&&H(te,e);var t=U.current,n=Hd(t,e.type);t!==n&&(H(W,e),H(U,n))}function ae(e){W.current===e&&(ee(U),ee(W)),te.current===e&&(ee(te),Qf._currentValue=R)}var K,oe;function se(e){if(K===void 0)try{throw Error()}catch(e){var t=e.stack.trim().match(/\n( *(at )?)/);K=t&&t[1]||``,oe=-1<e.stack.indexOf(`
     at`)?` (<anonymous>)`:-1<e.stack.indexOf(`@`)?`@unknown:0:0`:``}return`
 `+K+e+oe}var ce=!1;function le(e,t){if(!e||ce)return``;ce=!0;var n=Error.prepareStackTrace;Error.prepareStackTrace=void 0;try{var r={DetermineComponentFrameRoot:function(){try{if(t){var n=function(){throw Error()};if(Object.defineProperty(n.prototype,`props`,{set:function(){throw Error()}}),typeof Reflect==`object`&&Reflect.construct){try{Reflect.construct(n,[])}catch(e){var r=e}Reflect.construct(e,[],n)}else{try{n.call()}catch(e){r=e}e.call(n.prototype)}}else{try{throw Error()}catch(e){r=e}(n=e())&&typeof n.catch==`function`&&n.catch(function(){})}}catch(e){if(e&&r&&typeof e.stack==`string`)return[e.stack,r.stack]}return[null,null]}};r.DetermineComponentFrameRoot.displayName=`DetermineComponentFrameRoot`;var i=Object.getOwnPropertyDescriptor(r.DetermineComponentFrameRoot,`name`);i&&i.configurable&&Object.defineProperty(r.DetermineComponentFrameRoot,`name`,{value:`DetermineComponentFrameRoot`});var a=r.DetermineComponentFrameRoot(),o=a[0],s=a[1];if(o&&s){var c=o.split(`
@@ -216,4 +1781,4 @@ JOB DESCRIPTION
   "summary": "...",
   "skills": [{ "Category": ["Skill1"] }],
   "experience": [{ "title": "...", "sentences": ["..."] }]
-}`,className:`w-full h-64 mt-3 px-3 py-2.5 rounded-md border bg-[var(--bg)] text-[var(--text-h)] text-xs leading-relaxed resize-none focus:outline-none transition-colors font-mono ${r&&e.trim()?`border-red-400 focus:border-red-400`:`border-[var(--border)] focus:border-[var(--accent-border)]`}`}),r&&(0,y.jsx)(`p`,{className:`mt-1.5 text-[11px] text-red-500`,children:r})]})]})]})})}function Bl(){let[e,t]=(0,_.useState)(!1),[n,r]=(0,_.useState)(null),i=(0,_.useRef)(null),[a,o]=w(`resume-tailor:settings`,_l),s=(0,_.useMemo)(()=>({..._l,...a,primary:{..._l.primary,...a.primary},pageLayout:{..._l.pageLayout,...a.pageLayout},header:{..._l.header,...a.header,name:{..._l.header.name,...a.header?.name},jobTitle:{..._l.header.jobTitle,...a.header?.jobTitle}},sectionTitle:{..._l.sectionTitle,...a.sectionTitle}}),[a]),[c,l]=w(`resume-tailor:profile`,A),[u,d]=w(`resume-tailor:json-response`,``),f=(0,_.useMemo)(()=>Rl(c),[c]),p=(0,_.useMemo)(()=>Sl(c,u),[c,u]),m=(0,_.useMemo)(()=>{if(!u.trim())return``;try{let e=xl(yl(u)),t=JSON.parse(e);return typeof t.company==`string`?t.company.trim():``}catch{return``}},[u]),h=(0,_.useMemo)(()=>u.trim()?p?null:`Invalid JSON — unable to parse response`:`Paste a JSON response to preview your resume`,[u,p]),g=p||vl,[v,b]=(0,_.useState)(null),x=(0,_.useRef)(null);(0,_.useEffect)(()=>{if(!p){x.current&&URL.revokeObjectURL(x.current),x.current=null,b(null);return}let e=!1,t=setTimeout(async()=>{try{let t=await hl(g,s);if(e)return;x.current&&URL.revokeObjectURL(x.current),x.current=t,b(t)}catch{e||b(null)}},400);return()=>{e=!0,clearTimeout(t)}},[p,g,s]),(0,_.useEffect)(()=>()=>{x.current&&URL.revokeObjectURL(x.current)},[]);let S=(0,_.useCallback)((e,t)=>{i.current&&clearTimeout(i.current),r({message:e,type:t}),i.current=setTimeout(()=>r(null),3500)},[]),C=(0,_.useCallback)(async()=>{if(!m)S(`Company name is missing from JSON response`,`warning`);else try{await navigator.clipboard.writeText(m),S(`Company name "${m}" copied to clipboard`,`success`)}catch{}try{await ml(g,s)===`saved`&&(window.RTEmit&&window.RTEmit(`resume.generated`,{resume:g,settings:s,company:m,source:`preview-download`}),S(`Resume downloaded successfully`,`success`))}catch{S(`Failed to generate PDF`,`error`)}},[g,s,S,m]),T=(0,_.useCallback)(async e=>{let t=Sl(c,e);if(!t){S(`Invalid JSON — unable to parse response`,`error`);return}let n=(()=>{try{let t=JSON.parse(xl(yl(e)));return typeof t.company==`string`?t.company.trim():``}catch{return``}})();if(!n)S(`Company name is missing from JSON response`,`warning`);else try{await navigator.clipboard.writeText(n),S(`Company name "${n}" copied to clipboard`,`success`)}catch{}try{await ml(t,s)===`saved`&&(window.RTEmit&&window.RTEmit(`resume.generated`,{resume:t,settings:s,company:n,source:`auto-paste`}),S(`Resume downloaded successfully`,`success`))}catch{S(`Failed to generate PDF`,`error`)}},[c,s,S]),E=(0,_.useRef)(null),D=(0,_.useCallback)(async()=>{let e={version:1,profile:c,settings:s,jsonResponse:u},t=new Blob([JSON.stringify(e,null,2)],{type:`application/json`}),n=`resume-tailor-${c.fullName?c.fullName.replace(/\s+/g,`-`).toLowerCase():`export`}.json`;if(`showSaveFilePicker`in window)try{let e=await(await window.showSaveFilePicker({suggestedName:n,types:[{description:`JSON File`,accept:{"application/json":[`.json`]}}]})).createWritable();await e.write(t),await e.close(),window.RTEmit&&window.RTEmit(`profile.exported`,{profile:c,settings:s,jsonResponse:u,method:`file-picker`}),S(`Details saved successfully`,`success`);return}catch(e){if(e?.name===`AbortError`)return;S(`Failed to save details`,`error`)}else{let e=URL.createObjectURL(t),r=document.createElement(`a`);r.href=e,r.download=n,r.click(),URL.revokeObjectURL(e),window.RTEmit&&window.RTEmit(`profile.exported`,{profile:c,settings:s,jsonResponse:u,method:`download`}),S(`Details downloaded successfully`,`success`)}},[c,s,u,S]),O=(0,_.useCallback)(e=>{let t=e.target.files?.[0];if(!t)return;let n=new FileReader;n.onload=()=>{try{let e=JSON.parse(n.result);e.profile&&l(e.profile),e.settings&&o(e.settings),typeof e.jsonResponse==`string`&&d(e.jsonResponse),(window.RTEmit&&window.RTEmit(`profile.imported`,{profile:e.profile,settings:e.settings,jsonResponse:e.jsonResponse})),S(`Details loaded successfully`,`success`)}catch{S(`Invalid file format`,`error`)}},n.readAsText(t),e.target.value=``},[l,o,d,S]);return(0,y.jsxs)(`div`,{className:`flex h-full min-h-0`,children:[e&&(0,y.jsx)(`div`,{className:`fixed inset-0 bg-black/30 z-40 xl:hidden`,onClick:()=>t(!1)}),(0,y.jsx)(`div`,{className:`fixed inset-y-0 left-0 z-50 w-80 sm:w-96 bg-[var(--bg-surface)] border-r border-[var(--border)] overflow-y-auto transition-transform duration-300 ease-in-out xl:static xl:translate-x-0 xl:shrink-0 ${e?`translate-x-0`:`-translate-x-full`}`,"data-no-print":!0,children:(0,y.jsxs)(`div`,{className:`p-5 space-y-4`,children:[(0,y.jsxs)(`div`,{className:`flex items-center justify-between`,children:[(0,y.jsx)(`h1`,{className:`text-xl font-bold text-[var(--text-h)] tracking-tight`,children:`Customize Resume`}),(0,y.jsx)(`button`,{onClick:()=>t(!1),className:`xl:hidden p-1.5 rounded-md text-[var(--text)] hover:bg-[var(--accent-bg)] hover:text-[var(--accent)] transition-colors cursor-pointer`,children:(0,y.jsxs)(`svg`,{width:`18`,height:`18`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`2`,strokeLinecap:`round`,strokeLinejoin:`round`,children:[(0,y.jsx)(`line`,{x1:`18`,y1:`6`,x2:`6`,y2:`18`}),(0,y.jsx)(`line`,{x1:`6`,y1:`6`,x2:`18`,y2:`18`})]})})]}),(0,y.jsx)(Al,{value:s.primary,onChange:e=>o(t=>({...t,primary:e}))}),(0,y.jsx)(jl,{value:s.pageLayout,onChange:e=>o(t=>({...t,pageLayout:e}))}),(0,y.jsx)(Ml,{value:s.header,onChange:e=>o(t=>({...t,header:e}))}),(0,y.jsx)(Nl,{value:s.sectionTitle,onChange:e=>o(t=>({...t,sectionTitle:e}))}),(0,y.jsx)(Fl,{value:s.experienceLayout,onChange:e=>o(t=>({...t,experienceLayout:e}))}),(0,y.jsx)(Il,{boostEducation:s.boostEducation??!1,onChange:e=>o(t=>({...t,boostEducation:e}))})]})}),(0,y.jsxs)(`div`,{className:`flex-1 min-w-0 flex flex-col`,style:{backgroundColor:`var(--border)`},children:[(0,y.jsx)(`div`,{className:`shrink-0 z-10 w-full flex justify-center py-3 backdrop-blur-sm`,"data-no-print":!0,style:{backgroundColor:`color-mix(in srgb, var(--border) 80%, transparent)`,borderBottom:`1px solid var(--border)`},children:(0,y.jsxs)(`div`,{className:`flex items-center gap-3`,children:[(0,y.jsxs)(`button`,{onClick:()=>t(!0),className:`xl:hidden h-7 px-3 rounded-md border border-[var(--border)] bg-[var(--bg-surface)] text-xs font-medium text-[var(--text-h)] cursor-pointer hover:bg-[var(--accent-bg)] hover:text-[var(--accent)] transition-colors flex items-center gap-1.5`,title:`Customize Resume`,children:[(0,y.jsxs)(`svg`,{width:`14`,height:`14`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`2`,strokeLinecap:`round`,strokeLinejoin:`round`,children:[(0,y.jsx)(`circle`,{cx:`12`,cy:`12`,r:`3`}),(0,y.jsx)(`path`,{d:`M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z`})]}),`Customize`]}),(0,y.jsxs)(`button`,{onClick:C,disabled:!!h,className:`h-7 px-3 rounded-md border border-[var(--border)] bg-[var(--bg-surface)] text-xs font-medium transition-colors flex items-center gap-1.5 ${h?`text-[var(--text)] opacity-40 cursor-not-allowed`:`text-[var(--text-h)] cursor-pointer hover:bg-[var(--accent-bg)] hover:text-[var(--accent)]`}`,title:h?`Valid JSON response required`:`Download PDF`,children:[(0,y.jsxs)(`svg`,{width:`14`,height:`14`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`2`,strokeLinecap:`round`,strokeLinejoin:`round`,children:[(0,y.jsx)(`path`,{d:`M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4`}),(0,y.jsx)(`polyline`,{points:`7 10 12 15 17 10`}),(0,y.jsx)(`line`,{x1:`12`,y1:`15`,x2:`12`,y2:`3`})]}),`Download PDF`]}),(0,y.jsxs)(`button`,{onClick:D,className:`h-7 px-3 rounded-md border border-[var(--border)] bg-[var(--bg-surface)] text-xs font-medium text-[var(--text-h)] cursor-pointer hover:bg-[var(--accent-bg)] hover:text-[var(--accent)] transition-colors flex items-center gap-1.5`,title:`Export profile and settings as file`,children:[(0,y.jsxs)(`svg`,{width:`14`,height:`14`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`2`,strokeLinecap:`round`,strokeLinejoin:`round`,children:[(0,y.jsx)(`path`,{d:`M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z`}),(0,y.jsx)(`polyline`,{points:`14 2 14 8 20 8`}),(0,y.jsx)(`line`,{x1:`12`,y1:`18`,x2:`12`,y2:`12`}),(0,y.jsx)(`polyline`,{points:`9 15 12 12 15 15`})]}),`Save Details`]}),(0,y.jsxs)(`button`,{onClick:()=>E.current?.click(),className:`h-7 px-3 rounded-md border border-[var(--border)] bg-[var(--bg-surface)] text-xs font-medium text-[var(--text-h)] cursor-pointer hover:bg-[var(--accent-bg)] hover:text-[var(--accent)] transition-colors flex items-center gap-1.5`,title:`Import profile and settings from file`,children:[(0,y.jsxs)(`svg`,{width:`14`,height:`14`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`2`,strokeLinecap:`round`,strokeLinejoin:`round`,children:[(0,y.jsx)(`path`,{d:`M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z`}),(0,y.jsx)(`polyline`,{points:`14 2 14 8 20 8`}),(0,y.jsx)(`line`,{x1:`12`,y1:`12`,x2:`12`,y2:`18`}),(0,y.jsx)(`polyline`,{points:`9 15 12 18 15 15`})]}),`Load Details`]}),(0,y.jsx)(`input`,{ref:E,type:`file`,accept:`.json`,onChange:O,className:`hidden`})]})}),v?(0,y.jsx)(`iframe`,{src:v,className:`flex-1 w-full border-0`,title:`Resume PDF Preview`}):(0,y.jsx)(`div`,{className:`flex-1 flex items-center justify-center`,children:(0,y.jsxs)(`div`,{className:`text-center px-8`,children:[(0,y.jsxs)(`svg`,{className:`mx-auto mb-4 opacity-30`,width:`48`,height:`48`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`1.5`,strokeLinecap:`round`,strokeLinejoin:`round`,children:[(0,y.jsx)(`path`,{d:`M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z`}),(0,y.jsx)(`polyline`,{points:`14 2 14 8 20 8`}),(0,y.jsx)(`line`,{x1:`16`,y1:`13`,x2:`8`,y2:`13`}),(0,y.jsx)(`line`,{x1:`16`,y1:`17`,x2:`8`,y2:`17`}),(0,y.jsx)(`polyline`,{points:`10 9 9 9 8 9`})]}),(0,y.jsx)(`p`,{className:`text-sm font-medium opacity-50`,children:h||`Generating PDF Preview…`})]})})]}),(0,y.jsx)(zl,{jsonInput:u,onJsonChange:d,aiPrompt:f,jsonError:h,onDownloadWithJson:T}),n&&(0,y.jsxs)(`div`,{className:`fixed bottom-6 right-6 z-[100] flex items-center gap-2 rounded-lg px-4 py-3 text-sm font-medium shadow-lg transition-all animate-[slideUp_0.25s_ease-out] ${n.type===`success`?`bg-emerald-600 text-white`:n.type===`warning`?`bg-amber-500 text-white`:`bg-red-600 text-white`}`,children:[n.type===`success`?(0,y.jsx)(`svg`,{width:`16`,height:`16`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`2.5`,strokeLinecap:`round`,strokeLinejoin:`round`,children:(0,y.jsx)(`polyline`,{points:`20 6 9 17 4 12`})}):n.type===`warning`?(0,y.jsxs)(`svg`,{width:`16`,height:`16`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`2.5`,strokeLinecap:`round`,strokeLinejoin:`round`,children:[(0,y.jsx)(`path`,{d:`M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z`}),(0,y.jsx)(`line`,{x1:`12`,y1:`9`,x2:`12`,y2:`13`}),(0,y.jsx)(`line`,{x1:`12`,y1:`17`,x2:`12.01`,y2:`17`})]}):(0,y.jsxs)(`svg`,{width:`16`,height:`16`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`2.5`,strokeLinecap:`round`,strokeLinejoin:`round`,children:[(0,y.jsx)(`circle`,{cx:`12`,cy:`12`,r:`10`}),(0,y.jsx)(`line`,{x1:`15`,y1:`9`,x2:`9`,y2:`15`}),(0,y.jsx)(`line`,{x1:`9`,y1:`9`,x2:`15`,y2:`15`})]}),n.message,(0,y.jsx)(`button`,{onClick:()=>r(null),className:`ml-2 opacity-70 hover:opacity-100 cursor-pointer`,children:(0,y.jsxs)(`svg`,{width:`14`,height:`14`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`2`,strokeLinecap:`round`,strokeLinejoin:`round`,children:[(0,y.jsx)(`line`,{x1:`18`,y1:`6`,x2:`6`,y2:`18`}),(0,y.jsx)(`line`,{x1:`6`,y1:`6`,x2:`18`,y2:`18`})]})})]})]})}var Vl=[{name:`React`,desc:`Component-based UI library for building interactive interfaces.`,icon:(0,y.jsxs)(`svg`,{xmlns:`http://www.w3.org/2000/svg`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:1.5,strokeLinecap:`round`,strokeLinejoin:`round`,className:`w-5 h-5`,children:[(0,y.jsx)(`circle`,{cx:`12`,cy:`12`,r:`2`}),(0,y.jsx)(`ellipse`,{cx:`12`,cy:`12`,rx:`10`,ry:`4`}),(0,y.jsx)(`ellipse`,{cx:`12`,cy:`12`,rx:`10`,ry:`4`,transform:`rotate(60 12 12)`}),(0,y.jsx)(`ellipse`,{cx:`12`,cy:`12`,rx:`10`,ry:`4`,transform:`rotate(120 12 12)`})]})},{name:`TypeScript`,desc:`Strongly-typed JavaScript for safer, more maintainable code.`,icon:(0,y.jsxs)(`svg`,{xmlns:`http://www.w3.org/2000/svg`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:1.5,strokeLinecap:`round`,strokeLinejoin:`round`,className:`w-5 h-5`,children:[(0,y.jsx)(`rect`,{x:`3`,y:`3`,width:`18`,height:`18`,rx:`2`}),(0,y.jsx)(`path`,{d:`M12 8v8`}),(0,y.jsx)(`path`,{d:`M9 8h6`})]})},{name:`Vite`,desc:`Next-generation build tool for lightning-fast development.`,icon:(0,y.jsx)(`svg`,{xmlns:`http://www.w3.org/2000/svg`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:1.5,strokeLinecap:`round`,strokeLinejoin:`round`,className:`w-5 h-5`,children:(0,y.jsx)(`polygon`,{points:`13 2 3 14 12 14 11 22 21 10 12 10 13 2`})})},{name:`Tailwind CSS`,desc:`Utility-first CSS framework for rapid UI development.`,icon:(0,y.jsxs)(`svg`,{xmlns:`http://www.w3.org/2000/svg`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:1.5,strokeLinecap:`round`,strokeLinejoin:`round`,className:`w-5 h-5`,children:[(0,y.jsx)(`path`,{d:`M6.8 11.4S8.4 5.6 12 5.6c5.4 0 4.2 5.4 7.8 5.4 2.4 0 3.6-1.8 3.6-1.8`}),(0,y.jsx)(`path`,{d:`M.6 18.4S2.4 12.6 6 12.6c5.4 0 4.2 5.4 7.8 5.4 2.4 0 3.6-1.8 3.6-1.8`})]})}],Hl=[{title:`Privacy First`,desc:`Your data stays in your browser. Nothing is sent to external servers.`,icon:(0,y.jsxs)(`svg`,{xmlns:`http://www.w3.org/2000/svg`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:1.5,strokeLinecap:`round`,strokeLinejoin:`round`,className:`w-5 h-5`,children:[(0,y.jsx)(`rect`,{width:`18`,height:`11`,x:`3`,y:`11`,rx:`2`,ry:`2`}),(0,y.jsx)(`path`,{d:`M7 11V7a5 5 0 0 1 10 0v4`})]})},{title:`Free & Open`,desc:`No subscriptions, no hidden fees. Use all features at no cost.`,icon:(0,y.jsx)(`svg`,{xmlns:`http://www.w3.org/2000/svg`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:1.5,strokeLinecap:`round`,strokeLinejoin:`round`,className:`w-5 h-5`,children:(0,y.jsx)(`path`,{d:`M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78L12 21.23l8.84-8.84a5.5 5.5 0 0 0 0-7.78z`})})},{title:`Built for Speed`,desc:`Generate a tailored resume in seconds, not hours.`,icon:(0,y.jsxs)(`svg`,{xmlns:`http://www.w3.org/2000/svg`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:1.5,strokeLinecap:`round`,strokeLinejoin:`round`,className:`w-5 h-5`,children:[(0,y.jsx)(`circle`,{cx:`12`,cy:`12`,r:`10`}),(0,y.jsx)(`polyline`,{points:`12 6 12 12 16 14`})]})}],Ul=[{num:`01`,title:`Build Your Profile`,desc:`Enter your work experience, education, skills, and certifications.`},{num:`02`,title:`Paste a Job Description`,desc:`Provide the job posting you want to apply for.`},{num:`03`,title:`Get Your Resume`,desc:`Receive a tailored resume emphasizing relevant qualifications.`}];function Wl(){return(0,y.jsxs)(`div`,{className:`flex flex-col min-h-full px-8 py-12 pb-20 gap-12`,children:[(0,y.jsxs)(`div`,{className:`space-y-4 max-w-3xl`,children:[(0,y.jsxs)(`h1`,{className:`text-4xl font-extrabold tracking-tight text-[var(--text-h)]`,children:[`About`,` `,(0,y.jsx)(`span`,{style:{backgroundImage:`var(--accent-gradient)`,WebkitBackgroundClip:`text`,WebkitTextFillColor:`transparent`},children:`Resume Tailor`})]}),(0,y.jsx)(`p`,{className:`text-[var(--text)] text-lg leading-relaxed`,children:`Resume Tailor helps job seekers create perfectly targeted resumes. Instead of maintaining dozens of resume versions, enter your information once and generate a customized resume for each application.`})]}),(0,y.jsxs)(`div`,{className:`space-y-4`,children:[(0,y.jsx)(`h2`,{className:`text-xl font-bold text-[var(--text-h)]`,children:`Why Resume Tailor`}),(0,y.jsx)(`div`,{className:`grid grid-cols-1 sm:grid-cols-3 gap-4`,children:Hl.map(e=>(0,y.jsxs)(`div`,{className:`rounded-[var(--radius)] border border-[var(--border)] bg-[var(--bg-surface)] p-5 space-y-3 transition-colors hover:border-[var(--accent-border)]`,children:[(0,y.jsx)(`span`,{className:`inline-flex items-center justify-center w-9 h-9 rounded-lg text-white`,style:{backgroundImage:`var(--accent-gradient)`},children:e.icon}),(0,y.jsx)(`h3`,{className:`text-sm font-semibold text-[var(--text-h)]`,children:e.title}),(0,y.jsx)(`p`,{className:`text-xs text-[var(--text)] leading-relaxed`,children:e.desc})]},e.title))})]}),(0,y.jsxs)(`div`,{className:`space-y-4`,children:[(0,y.jsx)(`h2`,{className:`text-xl font-bold text-[var(--text-h)]`,children:`How It Works`}),(0,y.jsx)(`div`,{className:`grid grid-cols-1 sm:grid-cols-3 gap-4`,children:Ul.map((e,t)=>(0,y.jsxs)(`div`,{className:`rounded-[var(--radius)] border border-[var(--border)] bg-[var(--bg-surface)] p-5 space-y-3 relative`,children:[(0,y.jsx)(`span`,{className:`inline-flex items-center justify-center w-8 h-8 rounded-full text-xs font-bold text-white`,style:{backgroundImage:`var(--accent-gradient)`},children:t+1}),(0,y.jsx)(`h3`,{className:`text-sm font-semibold text-[var(--text-h)]`,children:e.title}),(0,y.jsx)(`p`,{className:`text-xs text-[var(--text)] leading-relaxed`,children:e.desc})]},e.num))})]}),(0,y.jsxs)(`div`,{className:`space-y-4`,children:[(0,y.jsx)(`h2`,{className:`text-xl font-bold text-[var(--text-h)]`,children:`Tech Stack`}),(0,y.jsx)(`div`,{className:`grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4`,children:Vl.map(e=>(0,y.jsxs)(`div`,{className:`rounded-[var(--radius)] border border-[var(--border)] bg-[var(--bg-surface)] p-5 space-y-3 transition-colors hover:border-[var(--accent-border)]`,children:[(0,y.jsx)(`span`,{className:`inline-flex items-center justify-center w-9 h-9 rounded-lg text-white`,style:{backgroundImage:`var(--accent-gradient)`},children:e.icon}),(0,y.jsx)(`h3`,{className:`text-sm font-semibold text-[var(--text-h)]`,children:e.name}),(0,y.jsx)(`p`,{className:`text-xs text-[var(--text)] leading-relaxed`,children:e.desc})]},e.name))})]})]})}var Gl=`w-full px-4 py-2.5 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--bg-surface)] text-[var(--text-h)] text-sm placeholder:text-[var(--text)] focus:outline-none focus:border-[var(--accent-border)] focus:ring-1 focus:ring-[var(--accent-border)] transition-colors`,Kl=[{label:`Email`,value:`hello@resumetailor.app`,icon:(0,y.jsxs)(`svg`,{xmlns:`http://www.w3.org/2000/svg`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:1.5,strokeLinecap:`round`,strokeLinejoin:`round`,className:`w-4.5 h-4.5`,children:[(0,y.jsx)(`rect`,{width:`20`,height:`16`,x:`2`,y:`4`,rx:`2`}),(0,y.jsx)(`path`,{d:`m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7`})]})},{label:`Response Time`,value:`Within 24 hours`,icon:(0,y.jsxs)(`svg`,{xmlns:`http://www.w3.org/2000/svg`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:1.5,strokeLinecap:`round`,strokeLinejoin:`round`,className:`w-4.5 h-4.5`,children:[(0,y.jsx)(`circle`,{cx:`12`,cy:`12`,r:`10`}),(0,y.jsx)(`polyline`,{points:`12 6 12 12 16 14`})]})},{label:`Location`,value:`Remote — Worldwide`,icon:(0,y.jsxs)(`svg`,{xmlns:`http://www.w3.org/2000/svg`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:1.5,strokeLinecap:`round`,strokeLinejoin:`round`,className:`w-4.5 h-4.5`,children:[(0,y.jsx)(`circle`,{cx:`12`,cy:`12`,r:`10`}),(0,y.jsx)(`path`,{d:`M2 12h20`}),(0,y.jsx)(`path`,{d:`M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z`})]})}],ql=[{q:`Is Resume Tailor free to use?`,a:`Yes. All features are completely free with no hidden fees or subscriptions.`},{q:`Is my data stored anywhere?`,a:`No. Everything stays in your browser. We don't send or store your data on any server.`},{q:`Can I export my resume as PDF?`,a:`Absolutely. You can download a polished, ATS-friendly PDF with one click.`},{q:`How does the tailoring work?`,a:`You enter your full profile once, then paste a job description. The app highlights and prioritizes the experience and skills most relevant to that role.`}];function Jl(){let[e,t]=(0,_.useState)({name:``,email:``,subject:``,message:``}),[n,r]=(0,_.useState)(!1),i=e=>n=>t(t=>({...t,[e]:n.target.value})),a=e.name.trim()&&e.email.trim()&&e.message.trim(),o=e=>{e.preventDefault(),a&&(r(!0),t({name:``,email:``,subject:``,message:``}))},[s,c]=(0,_.useState)(null);return(0,y.jsxs)(`div`,{className:`flex flex-col min-h-full px-8 py-12 pb-20 gap-10`,children:[(0,y.jsxs)(`div`,{className:`space-y-3`,children:[(0,y.jsxs)(`h1`,{className:`text-4xl font-extrabold tracking-tight text-[var(--text-h)]`,children:[`Get in`,` `,(0,y.jsx)(`span`,{style:{backgroundImage:`var(--accent-gradient)`,WebkitBackgroundClip:`text`,WebkitTextFillColor:`transparent`},children:`Touch`})]}),(0,y.jsx)(`p`,{className:`text-[var(--text)] text-lg leading-relaxed max-w-2xl`,children:`Have questions, feedback, or feature requests? We'd love to hear from you.`})]}),(0,y.jsxs)(`div`,{className:`grid grid-cols-1 lg:grid-cols-2 gap-8`,children:[(0,y.jsxs)(`form`,{onSubmit:o,className:`rounded-[var(--radius)] border border-[var(--border)] bg-[var(--bg-surface)] p-6 space-y-5`,children:[(0,y.jsx)(`h2`,{className:`text-lg font-bold text-[var(--text-h)]`,children:`Send a Message`}),n&&(0,y.jsx)(`div`,{className:`px-4 py-3 rounded-lg bg-green-500/10 border border-green-500/30 text-green-600 text-sm font-medium`,children:`Thanks for your message! We'll get back to you soon.`}),(0,y.jsxs)(`div`,{className:`grid grid-cols-1 sm:grid-cols-2 gap-4`,children:[(0,y.jsxs)(`div`,{children:[(0,y.jsx)(`label`,{className:`block text-xs font-medium text-[var(--text)] mb-1`,children:`Name`}),(0,y.jsx)(`input`,{type:`text`,className:Gl,placeholder:`Your name`,value:e.name,onChange:i(`name`)})]}),(0,y.jsxs)(`div`,{children:[(0,y.jsx)(`label`,{className:`block text-xs font-medium text-[var(--text)] mb-1`,children:`Email`}),(0,y.jsx)(`input`,{type:`email`,className:Gl,placeholder:`you@example.com`,value:e.email,onChange:i(`email`)})]})]}),(0,y.jsxs)(`div`,{children:[(0,y.jsx)(`label`,{className:`block text-xs font-medium text-[var(--text)] mb-1`,children:`Subject`}),(0,y.jsx)(`input`,{type:`text`,className:Gl,placeholder:`What is this about?`,value:e.subject,onChange:i(`subject`)})]}),(0,y.jsxs)(`div`,{children:[(0,y.jsx)(`label`,{className:`block text-xs font-medium text-[var(--text)] mb-1`,children:`Message`}),(0,y.jsx)(`textarea`,{rows:5,className:`${Gl} resize-none`,placeholder:`Tell us what's on your mind...`,value:e.message,onChange:i(`message`)})]}),(0,y.jsx)(`button`,{type:`submit`,disabled:!a,className:`px-6 py-2.5 rounded-lg text-sm font-semibold text-white transition-opacity ${a?`cursor-pointer hover:opacity-90`:`opacity-50 cursor-not-allowed`}`,style:{backgroundImage:`var(--accent-gradient)`},children:`Send Message`})]}),(0,y.jsx)(`div`,{className:`space-y-4`,children:Kl.map(e=>(0,y.jsxs)(`div`,{className:`rounded-[var(--radius)] border border-[var(--border)] bg-[var(--bg-surface)] p-5 flex items-start gap-4 transition-colors hover:border-[var(--accent-border)]`,children:[(0,y.jsx)(`span`,{className:`shrink-0 w-9 h-9 rounded-lg flex items-center justify-center text-white`,style:{backgroundImage:`var(--accent-gradient)`},children:e.icon}),(0,y.jsxs)(`div`,{children:[(0,y.jsx)(`p`,{className:`text-xs font-medium text-[var(--text)]`,children:e.label}),(0,y.jsx)(`p`,{className:`text-sm font-semibold text-[var(--text-h)]`,children:e.value})]})]},e.label))})]}),(0,y.jsxs)(`div`,{className:`space-y-4`,children:[(0,y.jsx)(`h2`,{className:`text-xl font-bold text-[var(--text-h)]`,children:`Frequently Asked Questions`}),(0,y.jsx)(`div`,{className:`space-y-2 max-w-3xl`,children:ql.map((e,t)=>(0,y.jsxs)(`div`,{className:`rounded-[var(--radius)] border border-[var(--border)] bg-[var(--bg-surface)] overflow-hidden transition-colors hover:border-[var(--accent-border)]`,children:[(0,y.jsxs)(`button`,{onClick:()=>c(s===t?null:t),className:`w-full flex items-center justify-between px-5 py-4 text-left cursor-pointer`,children:[(0,y.jsx)(`span`,{className:`text-sm font-semibold text-[var(--text-h)]`,children:e.q}),(0,y.jsx)(`svg`,{xmlns:`http://www.w3.org/2000/svg`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:2,strokeLinecap:`round`,strokeLinejoin:`round`,className:`w-4 h-4 text-[var(--text)] shrink-0 ml-4 transition-transform ${s===t?`rotate-180`:``}`,children:(0,y.jsx)(`polyline`,{points:`6 9 12 15 18 9`})})]}),s===t&&(0,y.jsx)(`div`,{className:`px-5 pb-4`,children:(0,y.jsx)(`p`,{className:`text-sm text-[var(--text)] leading-relaxed`,children:e.a})})]},t))})]})]})}function Yl(){return window.matchMedia(`(prefers-color-scheme: dark)`).matches?`dark`:`light`}function Xl(){let[e,t]=(0,_.useState)(()=>{try{let e=localStorage.getItem(`theme`);if(e===`light`||e===`dark`)return e}catch{}return Yl()});return(0,_.useEffect)(()=>{document.documentElement.classList.toggle(`dark`,e===`dark`);try{localStorage.setItem(`theme`,e)}catch{}},[e]),{theme:e,toggle:(0,_.useCallback)(()=>{t(e=>e===`dark`?`light`:`dark`)},[])}}var Zl={home:`Home`,profile:`Profile`,preview:`Preview`,about:`About`,contact:`Contact`},Ql=Object.keys(Zl);function RTwebhookRequired(){try{return!!(window.RTAccess&&window.RTAccess.requiresWebhook())}catch(e){return!1}}function RTuseBlockedTabs(){let[e,t]=(0,_.useState)(()=>window.RTAccess?window.RTAccess.blockedTabs():[]);return(0,_.useEffect)(()=>{let n=()=>{let r=window.RTAccess?window.RTAccess.blockedTabs():[];t(e=>e.length===r.length&&e.every((e,t)=>e===r[t])?e:r)},r=window.RTAccess&&window.RTAccess.event||`resume-tailor:access-changed`;return document.addEventListener(r,n),n(),()=>document.removeEventListener(r,n)},[]),e}function $l(){let[e,t]=(0,_.useState)(`home`),RTblocked=RTuseBlockedTabs(),RTtab=RTblocked.includes(e)?window.RTAccess&&window.RTAccess.fallbackTab()||`home`:e,{theme:n,toggle:r}=Xl(),i=(0,_.useCallback)(e=>{e in Zl&&!(window.RTAccess&&window.RTAccess.isBlockedTab(e))&&t(e)},[RTblocked]);(0,_.useEffect)(()=>{RTtab!==e&&t(RTtab)},[RTtab,e]);return(0,y.jsxs)(`div`,{className:`flex flex-col h-screen overflow-hidden`,children:[(0,y.jsx)(`header`,{className:`shrink-0 border-b border-[var(--border)] bg-[var(--nav-bg)]`,children:(0,y.jsxs)(`nav`,{className:`flex items-center justify-between px-8 py-3`,children:[(0,y.jsx)(`div`,{className:`text-lg font-bold tracking-tight cursor-pointer text-[var(--text-h)]`,onClick:()=>t(`home`),children:`Resume Tailor`}),(0,y.jsxs)(`div`,{className:`flex items-center gap-1`,children:[Ql.filter(e=>!RTblocked.includes(e)).map(n=>(0,y.jsx)(`button`,{onClick:()=>t(n),className:`px-4 py-1.5 rounded-lg text-sm font-medium transition-colors cursor-pointer ${RTtab===n?`text-white`:`text-[var(--text)] hover:bg-[var(--accent-bg)] hover:text-[var(--accent)]`}`,style:RTtab===n?{backgroundImage:`var(--accent-gradient)`}:void 0,children:Zl[n]},n)),(0,y.jsx)(`div`,{className:`w-px h-5 bg-[var(--border)] mx-2`}),(0,y.jsx)(`button`,{onClick:r,className:`p-2 rounded-lg text-[var(--text)] hover:bg-[var(--accent-bg)] hover:text-[var(--accent)] transition-colors cursor-pointer`,"aria-label":`Switch to ${n===`dark`?`light`:`dark`} mode`,title:`Switch to ${n===`dark`?`light`:`dark`} mode`,children:n===`dark`?(0,y.jsxs)(`svg`,{width:`18`,height:`18`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`2`,strokeLinecap:`round`,strokeLinejoin:`round`,children:[(0,y.jsx)(`circle`,{cx:`12`,cy:`12`,r:`5`}),(0,y.jsx)(`line`,{x1:`12`,y1:`1`,x2:`12`,y2:`3`}),(0,y.jsx)(`line`,{x1:`12`,y1:`21`,x2:`12`,y2:`23`}),(0,y.jsx)(`line`,{x1:`4.22`,y1:`4.22`,x2:`5.64`,y2:`5.64`}),(0,y.jsx)(`line`,{x1:`18.36`,y1:`18.36`,x2:`19.78`,y2:`19.78`}),(0,y.jsx)(`line`,{x1:`1`,y1:`12`,x2:`3`,y2:`12`}),(0,y.jsx)(`line`,{x1:`21`,y1:`12`,x2:`23`,y2:`12`}),(0,y.jsx)(`line`,{x1:`4.22`,y1:`19.78`,x2:`5.64`,y2:`18.36`}),(0,y.jsx)(`line`,{x1:`18.36`,y1:`5.64`,x2:`19.78`,y2:`4.22`})]}):(0,y.jsx)(`svg`,{width:`18`,height:`18`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`2`,strokeLinecap:`round`,strokeLinejoin:`round`,children:(0,y.jsx)(`path`,{d:`M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z`})})})]})]})}),(0,y.jsxs)(`main`,{className:`flex-1 min-h-0 overflow-auto`,children:[RTtab===`home`&&(0,y.jsx)(C,{onNavigate:i}),RTtab===`profile`&&(0,y.jsx)(I,{}),RTtab===`preview`&&(0,y.jsx)(Bl,{}),RTtab===`about`&&(0,y.jsx)(Wl,{}),RTtab===`contact`&&(0,y.jsx)(Jl,{})]}),(0,y.jsxs)(`footer`,{className:`shrink-0 border-t border-[var(--border)] bg-[var(--footer-bg)] px-8 py-3 flex items-center justify-between text-xs text-[var(--text)]`,children:[(0,y.jsxs)(`span`,{children:[`© `,new Date().getFullYear(),` Resume Tailor`]}),(0,y.jsx)(`span`,{children:`Designed & Developed by Akira`})]})]})}(0,g.createRoot)(document.getElementById(`root`)).render((0,y.jsx)(_.StrictMode,{children:(0,y.jsx)($l,{})}));export{o as n,c as r,L as t};
+}`,className:`w-full h-64 mt-3 px-3 py-2.5 rounded-md border bg-[var(--bg)] text-[var(--text-h)] text-xs leading-relaxed resize-none focus:outline-none transition-colors font-mono ${r&&e.trim()?`border-red-400 focus:border-red-400`:`border-[var(--border)] focus:border-[var(--accent-border)]`}`}),r&&(0,y.jsx)(`p`,{className:`mt-1.5 text-[11px] text-red-500`,children:r})]})]})]})})}function Bl(){let[e,t]=(0,_.useState)(!1),[n,r]=(0,_.useState)(null),i=(0,_.useRef)(null),[a,o]=w(`resume-tailor:settings`,_l),s=(0,_.useMemo)(()=>({..._l,...a,primary:{..._l.primary,...a.primary},pageLayout:{..._l.pageLayout,...a.pageLayout},header:{..._l.header,...a.header,name:{..._l.header.name,...a.header?.name},jobTitle:{..._l.header.jobTitle,...a.header?.jobTitle}},sectionTitle:{..._l.sectionTitle,...a.sectionTitle}}),[a]),[c,l]=w(`resume-tailor:profile`,A),[u,d]=w(`resume-tailor:json-response`,``),f=(0,_.useMemo)(()=>Rl(c),[c]),p=(0,_.useMemo)(()=>Sl(c,u),[c,u]),m=(0,_.useMemo)(()=>{if(!u.trim())return``;try{let e=xl(yl(u)),t=JSON.parse(e);return typeof t.company==`string`?t.company.trim():``}catch{return``}},[u]),h=(0,_.useMemo)(()=>u.trim()?p?null:`Invalid JSON — unable to parse response`:`Paste a JSON response to preview your resume`,[u,p]),g=p||vl,[v,b]=(0,_.useState)(null),x=(0,_.useRef)(null);(0,_.useEffect)(()=>{if(!p){x.current&&URL.revokeObjectURL(x.current),x.current=null,b(null);return}let e=!1,t=setTimeout(async()=>{try{let t=await hl(g,s);if(e)return;x.current&&URL.revokeObjectURL(x.current),x.current=t,b(t)}catch{e||b(null)}},400);return()=>{e=!0,clearTimeout(t)}},[p,g,s]),(0,_.useEffect)(()=>()=>{x.current&&URL.revokeObjectURL(x.current)},[]);let S=(0,_.useCallback)((e,t)=>{i.current&&clearTimeout(i.current),r({message:e,type:t}),i.current=setTimeout(()=>r(null),3500)},[]),C=(0,_.useCallback)(async()=>{if(!m)S(`Company name is missing from JSON response`,`warning`);else try{await navigator.clipboard.writeText(m),S(`Company name "${m}" copied to clipboard`,`success`)}catch{}try{await ml(g,s)===`saved`&&(window.RTEmit&&window.RTEmit(`resume.generated`,{resume:g,settings:s,company:m,source:`preview-download`}),S(`Resume downloaded successfully`,`success`))}catch{S(`Failed to generate PDF`,`error`)}},[g,s,S,m]),T=(0,_.useCallback)(async e=>{let t=Sl(c,e);if(!t){S(`Invalid JSON — unable to parse response`,`error`);return}let n=(()=>{try{let t=JSON.parse(xl(yl(e)));return typeof t.company==`string`?t.company.trim():``}catch{return``}})();if(!n)S(`Company name is missing from JSON response`,`warning`);else try{await navigator.clipboard.writeText(n),S(`Company name "${n}" copied to clipboard`,`success`)}catch{}try{await ml(t,s)===`saved`&&(window.RTEmit&&window.RTEmit(`resume.generated`,{resume:t,settings:s,company:n,source:`auto-paste`}),S(`Resume downloaded successfully`,`success`))}catch{S(`Failed to generate PDF`,`error`)}},[c,s,S]),E=(0,_.useRef)(null),D=(0,_.useCallback)(async()=>{let e={version:1,profile:c,settings:s,jsonResponse:u},t=new Blob([JSON.stringify(e,null,2)],{type:`application/json`}),n=`resume-tailor-${c.fullName?c.fullName.replace(/\s+/g,`-`).toLowerCase():`export`}.json`;if(`showSaveFilePicker`in window)try{let e=await(await window.showSaveFilePicker({suggestedName:n,types:[{description:`JSON File`,accept:{"application/json":[`.json`]}}]})).createWritable();await e.write(t),await e.close(),window.RTEmit&&window.RTEmit(`profile.exported`,{profile:c,settings:s,jsonResponse:u,method:`file-picker`}),S(`Details saved successfully`,`success`);return}catch(e){if(e?.name===`AbortError`)return;S(`Failed to save details`,`error`)}else{let e=URL.createObjectURL(t),r=document.createElement(`a`);r.href=e,r.download=n,r.click(),URL.revokeObjectURL(e),window.RTEmit&&window.RTEmit(`profile.exported`,{profile:c,settings:s,jsonResponse:u,method:`download`}),S(`Details downloaded successfully`,`success`)}},[c,s,u,S]),O=(0,_.useCallback)(e=>{let t=e.target.files?.[0];if(!t)return;let n=new FileReader;n.onload=()=>{try{let e=JSON.parse(n.result);e.profile&&l(e.profile),e.settings&&o(e.settings),typeof e.jsonResponse==`string`&&d(e.jsonResponse),(window.RTEmit&&window.RTEmit(`profile.imported`,{profile:e.profile,settings:e.settings,jsonResponse:e.jsonResponse})),S(`Details loaded successfully`,`success`)}catch{S(`Invalid file format`,`error`)}},n.readAsText(t),e.target.value=``},[l,o,d,S]);return(0,y.jsxs)(`div`,{className:`flex h-full min-h-0`,children:[e&&(0,y.jsx)(`div`,{className:`fixed inset-0 bg-black/30 z-40 xl:hidden`,onClick:()=>t(!1)}),(0,y.jsx)(`div`,{className:`fixed inset-y-0 left-0 z-50 w-80 sm:w-96 bg-[var(--bg-surface)] border-r border-[var(--border)] overflow-y-auto transition-transform duration-300 ease-in-out xl:static xl:translate-x-0 xl:shrink-0 ${e?`translate-x-0`:`-translate-x-full`}`,"data-no-print":!0,children:(0,y.jsxs)(`div`,{className:`p-5 space-y-4`,children:[(0,y.jsxs)(`div`,{className:`flex items-center justify-between`,children:[(0,y.jsx)(`h1`,{className:`text-xl font-bold text-[var(--text-h)] tracking-tight`,children:`Customize Resume`}),(0,y.jsx)(`button`,{onClick:()=>t(!1),className:`xl:hidden p-1.5 rounded-md text-[var(--text)] hover:bg-[var(--accent-bg)] hover:text-[var(--accent)] transition-colors cursor-pointer`,children:(0,y.jsxs)(`svg`,{width:`18`,height:`18`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`2`,strokeLinecap:`round`,strokeLinejoin:`round`,children:[(0,y.jsx)(`line`,{x1:`18`,y1:`6`,x2:`6`,y2:`18`}),(0,y.jsx)(`line`,{x1:`6`,y1:`6`,x2:`18`,y2:`18`})]})})]}),(0,y.jsx)(Al,{value:s.primary,onChange:e=>o(t=>({...t,primary:e}))}),(0,y.jsx)(jl,{value:s.pageLayout,onChange:e=>o(t=>({...t,pageLayout:e}))}),(0,y.jsx)(Ml,{value:s.header,onChange:e=>o(t=>({...t,header:e}))}),(0,y.jsx)(Nl,{value:s.sectionTitle,onChange:e=>o(t=>({...t,sectionTitle:e}))}),(0,y.jsx)(Fl,{value:s.experienceLayout,onChange:e=>o(t=>({...t,experienceLayout:e}))}),(0,y.jsx)(Il,{boostEducation:s.boostEducation??!1,onChange:e=>o(t=>({...t,boostEducation:e}))})]})}),(0,y.jsxs)(`div`,{className:`flex-1 min-w-0 flex flex-col`,style:{backgroundColor:`var(--border)`},children:[(0,y.jsx)(`div`,{className:`shrink-0 z-10 w-full flex justify-center py-3 backdrop-blur-sm`,"data-no-print":!0,style:{backgroundColor:`color-mix(in srgb, var(--border) 80%, transparent)`,borderBottom:`1px solid var(--border)`},children:(0,y.jsxs)(`div`,{className:`flex items-center gap-3`,children:[(0,y.jsxs)(`button`,{onClick:()=>t(!0),className:`xl:hidden h-7 px-3 rounded-md border border-[var(--border)] bg-[var(--bg-surface)] text-xs font-medium text-[var(--text-h)] cursor-pointer hover:bg-[var(--accent-bg)] hover:text-[var(--accent)] transition-colors flex items-center gap-1.5`,title:`Customize Resume`,children:[(0,y.jsxs)(`svg`,{width:`14`,height:`14`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`2`,strokeLinecap:`round`,strokeLinejoin:`round`,children:[(0,y.jsx)(`circle`,{cx:`12`,cy:`12`,r:`3`}),(0,y.jsx)(`path`,{d:`M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z`})]}),`Customize`]}),(0,y.jsxs)(`button`,{onClick:C,disabled:!!h,className:`h-7 px-3 rounded-md border border-[var(--border)] bg-[var(--bg-surface)] text-xs font-medium transition-colors flex items-center gap-1.5 ${h?`text-[var(--text)] opacity-40 cursor-not-allowed`:`text-[var(--text-h)] cursor-pointer hover:bg-[var(--accent-bg)] hover:text-[var(--accent)]`}`,title:h?`Valid JSON response required`:`Download PDF`,children:[(0,y.jsxs)(`svg`,{width:`14`,height:`14`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`2`,strokeLinecap:`round`,strokeLinejoin:`round`,children:[(0,y.jsx)(`path`,{d:`M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4`}),(0,y.jsx)(`polyline`,{points:`7 10 12 15 17 10`}),(0,y.jsx)(`line`,{x1:`12`,y1:`15`,x2:`12`,y2:`3`})]}),`Download PDF`]}),(0,y.jsxs)(`button`,{onClick:D,className:`h-7 px-3 rounded-md border border-[var(--border)] bg-[var(--bg-surface)] text-xs font-medium text-[var(--text-h)] cursor-pointer hover:bg-[var(--accent-bg)] hover:text-[var(--accent)] transition-colors flex items-center gap-1.5`,title:`Export profile and settings as file`,children:[(0,y.jsxs)(`svg`,{width:`14`,height:`14`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`2`,strokeLinecap:`round`,strokeLinejoin:`round`,children:[(0,y.jsx)(`path`,{d:`M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z`}),(0,y.jsx)(`polyline`,{points:`14 2 14 8 20 8`}),(0,y.jsx)(`line`,{x1:`12`,y1:`18`,x2:`12`,y2:`12`}),(0,y.jsx)(`polyline`,{points:`9 15 12 12 15 15`})]}),`Save Details`]}),(0,y.jsxs)(`button`,{onClick:()=>E.current?.click(),className:`h-7 px-3 rounded-md border border-[var(--border)] bg-[var(--bg-surface)] text-xs font-medium text-[var(--text-h)] cursor-pointer hover:bg-[var(--accent-bg)] hover:text-[var(--accent)] transition-colors flex items-center gap-1.5`,title:`Import profile and settings from file`,children:[(0,y.jsxs)(`svg`,{width:`14`,height:`14`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`2`,strokeLinecap:`round`,strokeLinejoin:`round`,children:[(0,y.jsx)(`path`,{d:`M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z`}),(0,y.jsx)(`polyline`,{points:`14 2 14 8 20 8`}),(0,y.jsx)(`line`,{x1:`12`,y1:`12`,x2:`12`,y2:`18`}),(0,y.jsx)(`polyline`,{points:`9 15 12 18 15 15`})]}),`Load Details`]}),(0,y.jsx)(`input`,{ref:E,type:`file`,accept:`.json`,onChange:O,className:`hidden`})]})}),v?(0,y.jsx)(`iframe`,{src:v,className:`flex-1 w-full border-0`,title:`Resume PDF Preview`}):(0,y.jsx)(`div`,{className:`flex-1 flex items-center justify-center`,children:(0,y.jsxs)(`div`,{className:`text-center px-8`,children:[(0,y.jsxs)(`svg`,{className:`mx-auto mb-4 opacity-30`,width:`48`,height:`48`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`1.5`,strokeLinecap:`round`,strokeLinejoin:`round`,children:[(0,y.jsx)(`path`,{d:`M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z`}),(0,y.jsx)(`polyline`,{points:`14 2 14 8 20 8`}),(0,y.jsx)(`line`,{x1:`16`,y1:`13`,x2:`8`,y2:`13`}),(0,y.jsx)(`line`,{x1:`16`,y1:`17`,x2:`8`,y2:`17`}),(0,y.jsx)(`polyline`,{points:`10 9 9 9 8 9`})]}),(0,y.jsx)(`p`,{className:`text-sm font-medium opacity-50`,children:h||`Generating PDF Preview…`})]})})]}),(0,y.jsx)(zl,{jsonInput:u,onJsonChange:d,aiPrompt:f,jsonError:h,onDownloadWithJson:T}),n&&(0,y.jsxs)(`div`,{className:`fixed bottom-6 right-6 z-[100] flex items-center gap-2 rounded-lg px-4 py-3 text-sm font-medium shadow-lg transition-all animate-[slideUp_0.25s_ease-out] ${n.type===`success`?`bg-emerald-600 text-white`:n.type===`warning`?`bg-amber-500 text-white`:`bg-red-600 text-white`}`,children:[n.type===`success`?(0,y.jsx)(`svg`,{width:`16`,height:`16`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`2.5`,strokeLinecap:`round`,strokeLinejoin:`round`,children:(0,y.jsx)(`polyline`,{points:`20 6 9 17 4 12`})}):n.type===`warning`?(0,y.jsxs)(`svg`,{width:`16`,height:`16`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`2.5`,strokeLinecap:`round`,strokeLinejoin:`round`,children:[(0,y.jsx)(`path`,{d:`M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z`}),(0,y.jsx)(`line`,{x1:`12`,y1:`9`,x2:`12`,y2:`13`}),(0,y.jsx)(`line`,{x1:`12`,y1:`17`,x2:`12.01`,y2:`17`})]}):(0,y.jsxs)(`svg`,{width:`16`,height:`16`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`2.5`,strokeLinecap:`round`,strokeLinejoin:`round`,children:[(0,y.jsx)(`circle`,{cx:`12`,cy:`12`,r:`10`}),(0,y.jsx)(`line`,{x1:`15`,y1:`9`,x2:`9`,y2:`15`}),(0,y.jsx)(`line`,{x1:`9`,y1:`9`,x2:`15`,y2:`15`})]}),n.message,(0,y.jsx)(`button`,{onClick:()=>r(null),className:`ml-2 opacity-70 hover:opacity-100 cursor-pointer`,children:(0,y.jsxs)(`svg`,{width:`14`,height:`14`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`2`,strokeLinecap:`round`,strokeLinejoin:`round`,children:[(0,y.jsx)(`line`,{x1:`18`,y1:`6`,x2:`6`,y2:`18`}),(0,y.jsx)(`line`,{x1:`6`,y1:`6`,x2:`18`,y2:`18`})]})})]})]})}var Vl=[{name:`React`,desc:`Component-based UI library for building interactive interfaces.`,icon:(0,y.jsxs)(`svg`,{xmlns:`http://www.w3.org/2000/svg`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:1.5,strokeLinecap:`round`,strokeLinejoin:`round`,className:`w-5 h-5`,children:[(0,y.jsx)(`circle`,{cx:`12`,cy:`12`,r:`2`}),(0,y.jsx)(`ellipse`,{cx:`12`,cy:`12`,rx:`10`,ry:`4`}),(0,y.jsx)(`ellipse`,{cx:`12`,cy:`12`,rx:`10`,ry:`4`,transform:`rotate(60 12 12)`}),(0,y.jsx)(`ellipse`,{cx:`12`,cy:`12`,rx:`10`,ry:`4`,transform:`rotate(120 12 12)`})]})},{name:`TypeScript`,desc:`Strongly-typed JavaScript for safer, more maintainable code.`,icon:(0,y.jsxs)(`svg`,{xmlns:`http://www.w3.org/2000/svg`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:1.5,strokeLinecap:`round`,strokeLinejoin:`round`,className:`w-5 h-5`,children:[(0,y.jsx)(`rect`,{x:`3`,y:`3`,width:`18`,height:`18`,rx:`2`}),(0,y.jsx)(`path`,{d:`M12 8v8`}),(0,y.jsx)(`path`,{d:`M9 8h6`})]})},{name:`Vite`,desc:`Next-generation build tool for lightning-fast development.`,icon:(0,y.jsx)(`svg`,{xmlns:`http://www.w3.org/2000/svg`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:1.5,strokeLinecap:`round`,strokeLinejoin:`round`,className:`w-5 h-5`,children:(0,y.jsx)(`polygon`,{points:`13 2 3 14 12 14 11 22 21 10 12 10 13 2`})})},{name:`Tailwind CSS`,desc:`Utility-first CSS framework for rapid UI development.`,icon:(0,y.jsxs)(`svg`,{xmlns:`http://www.w3.org/2000/svg`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:1.5,strokeLinecap:`round`,strokeLinejoin:`round`,className:`w-5 h-5`,children:[(0,y.jsx)(`path`,{d:`M6.8 11.4S8.4 5.6 12 5.6c5.4 0 4.2 5.4 7.8 5.4 2.4 0 3.6-1.8 3.6-1.8`}),(0,y.jsx)(`path`,{d:`M.6 18.4S2.4 12.6 6 12.6c5.4 0 4.2 5.4 7.8 5.4 2.4 0 3.6-1.8 3.6-1.8`})]})}],Hl=[{title:`Privacy First`,desc:`Your data stays in your browser. Nothing is sent to external servers.`,icon:(0,y.jsxs)(`svg`,{xmlns:`http://www.w3.org/2000/svg`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:1.5,strokeLinecap:`round`,strokeLinejoin:`round`,className:`w-5 h-5`,children:[(0,y.jsx)(`rect`,{width:`18`,height:`11`,x:`3`,y:`11`,rx:`2`,ry:`2`}),(0,y.jsx)(`path`,{d:`M7 11V7a5 5 0 0 1 10 0v4`})]})},{title:`Free & Open`,desc:`No subscriptions, no hidden fees. Use all features at no cost.`,icon:(0,y.jsx)(`svg`,{xmlns:`http://www.w3.org/2000/svg`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:1.5,strokeLinecap:`round`,strokeLinejoin:`round`,className:`w-5 h-5`,children:(0,y.jsx)(`path`,{d:`M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78L12 21.23l8.84-8.84a5.5 5.5 0 0 0 0-7.78z`})})},{title:`Built for Speed`,desc:`Generate a tailored resume in seconds, not hours.`,icon:(0,y.jsxs)(`svg`,{xmlns:`http://www.w3.org/2000/svg`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:1.5,strokeLinecap:`round`,strokeLinejoin:`round`,className:`w-5 h-5`,children:[(0,y.jsx)(`circle`,{cx:`12`,cy:`12`,r:`10`}),(0,y.jsx)(`polyline`,{points:`12 6 12 12 16 14`})]})}],Ul=[{num:`01`,title:`Build Your Profile`,desc:`Enter your work experience, education, skills, and certifications.`},{num:`02`,title:`Paste a Job Description`,desc:`Provide the job posting you want to apply for.`},{num:`03`,title:`Get Your Resume`,desc:`Receive a tailored resume emphasizing relevant qualifications.`}];function Wl(){return(0,y.jsxs)(`div`,{className:`flex flex-col min-h-full px-8 py-12 pb-20 gap-12`,children:[(0,y.jsxs)(`div`,{className:`space-y-4 max-w-3xl`,children:[(0,y.jsxs)(`h1`,{className:`text-4xl font-extrabold tracking-tight text-[var(--text-h)]`,children:[`About`,` `,(0,y.jsx)(`span`,{style:{backgroundImage:`var(--accent-gradient)`,WebkitBackgroundClip:`text`,WebkitTextFillColor:`transparent`},children:`Resume Tailor`})]}),(0,y.jsx)(`p`,{className:`text-[var(--text)] text-lg leading-relaxed`,children:`Resume Tailor helps job seekers create perfectly targeted resumes. Instead of maintaining dozens of resume versions, enter your information once and generate a customized resume for each application.`})]}),(0,y.jsxs)(`div`,{className:`space-y-4`,children:[(0,y.jsx)(`h2`,{className:`text-xl font-bold text-[var(--text-h)]`,children:`Why Resume Tailor`}),(0,y.jsx)(`div`,{className:`grid grid-cols-1 sm:grid-cols-3 gap-4`,children:Hl.map(e=>(0,y.jsxs)(`div`,{className:`rounded-[var(--radius)] border border-[var(--border)] bg-[var(--bg-surface)] p-5 space-y-3 transition-colors hover:border-[var(--accent-border)]`,children:[(0,y.jsx)(`span`,{className:`inline-flex items-center justify-center w-9 h-9 rounded-lg text-white`,style:{backgroundImage:`var(--accent-gradient)`},children:e.icon}),(0,y.jsx)(`h3`,{className:`text-sm font-semibold text-[var(--text-h)]`,children:e.title}),(0,y.jsx)(`p`,{className:`text-xs text-[var(--text)] leading-relaxed`,children:e.desc})]},e.title))})]}),(0,y.jsxs)(`div`,{className:`space-y-4`,children:[(0,y.jsx)(`h2`,{className:`text-xl font-bold text-[var(--text-h)]`,children:`How It Works`}),(0,y.jsx)(`div`,{className:`grid grid-cols-1 sm:grid-cols-3 gap-4`,children:Ul.map((e,t)=>(0,y.jsxs)(`div`,{className:`rounded-[var(--radius)] border border-[var(--border)] bg-[var(--bg-surface)] p-5 space-y-3 relative`,children:[(0,y.jsx)(`span`,{className:`inline-flex items-center justify-center w-8 h-8 rounded-full text-xs font-bold text-white`,style:{backgroundImage:`var(--accent-gradient)`},children:t+1}),(0,y.jsx)(`h3`,{className:`text-sm font-semibold text-[var(--text-h)]`,children:e.title}),(0,y.jsx)(`p`,{className:`text-xs text-[var(--text)] leading-relaxed`,children:e.desc})]},e.num))})]}),(0,y.jsxs)(`div`,{className:`space-y-4`,children:[(0,y.jsx)(`h2`,{className:`text-xl font-bold text-[var(--text-h)]`,children:`Tech Stack`}),(0,y.jsx)(`div`,{className:`grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4`,children:Vl.map(e=>(0,y.jsxs)(`div`,{className:`rounded-[var(--radius)] border border-[var(--border)] bg-[var(--bg-surface)] p-5 space-y-3 transition-colors hover:border-[var(--accent-border)]`,children:[(0,y.jsx)(`span`,{className:`inline-flex items-center justify-center w-9 h-9 rounded-lg text-white`,style:{backgroundImage:`var(--accent-gradient)`},children:e.icon}),(0,y.jsx)(`h3`,{className:`text-sm font-semibold text-[var(--text-h)]`,children:e.name}),(0,y.jsx)(`p`,{className:`text-xs text-[var(--text)] leading-relaxed`,children:e.desc})]},e.name))})]})]})}var Gl=`w-full px-4 py-2.5 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--bg-surface)] text-[var(--text-h)] text-sm placeholder:text-[var(--text)] focus:outline-none focus:border-[var(--accent-border)] focus:ring-1 focus:ring-[var(--accent-border)] transition-colors`,Kl=[{label:`Email`,value:`hello@resumetailor.app`,icon:(0,y.jsxs)(`svg`,{xmlns:`http://www.w3.org/2000/svg`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:1.5,strokeLinecap:`round`,strokeLinejoin:`round`,className:`w-4.5 h-4.5`,children:[(0,y.jsx)(`rect`,{width:`20`,height:`16`,x:`2`,y:`4`,rx:`2`}),(0,y.jsx)(`path`,{d:`m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7`})]})},{label:`Response Time`,value:`Within 24 hours`,icon:(0,y.jsxs)(`svg`,{xmlns:`http://www.w3.org/2000/svg`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:1.5,strokeLinecap:`round`,strokeLinejoin:`round`,className:`w-4.5 h-4.5`,children:[(0,y.jsx)(`circle`,{cx:`12`,cy:`12`,r:`10`}),(0,y.jsx)(`polyline`,{points:`12 6 12 12 16 14`})]})},{label:`Location`,value:`Remote — Worldwide`,icon:(0,y.jsxs)(`svg`,{xmlns:`http://www.w3.org/2000/svg`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:1.5,strokeLinecap:`round`,strokeLinejoin:`round`,className:`w-4.5 h-4.5`,children:[(0,y.jsx)(`circle`,{cx:`12`,cy:`12`,r:`10`}),(0,y.jsx)(`path`,{d:`M2 12h20`}),(0,y.jsx)(`path`,{d:`M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z`})]})}],ql=[{q:`Is Resume Tailor free to use?`,a:`Yes. All features are completely free with no hidden fees or subscriptions.`},{q:`Is my data stored anywhere?`,a:`No. Everything stays in your browser. We don't send or store your data on any server.`},{q:`Can I export my resume as PDF?`,a:`Absolutely. You can download a polished, ATS-friendly PDF with one click.`},{q:`How does the tailoring work?`,a:`You enter your full profile once, then paste a job description. The app highlights and prioritizes the experience and skills most relevant to that role.`}];function Jl(){let[e,t]=(0,_.useState)({name:``,email:``,subject:``,message:``}),[n,r]=(0,_.useState)(!1),i=e=>n=>t(t=>({...t,[e]:n.target.value})),a=e.name.trim()&&e.email.trim()&&e.message.trim(),o=e=>{e.preventDefault(),a&&(r(!0),t({name:``,email:``,subject:``,message:``}))},[s,c]=(0,_.useState)(null);return(0,y.jsxs)(`div`,{className:`flex flex-col min-h-full px-8 py-12 pb-20 gap-10`,children:[(0,y.jsxs)(`div`,{className:`space-y-3`,children:[(0,y.jsxs)(`h1`,{className:`text-4xl font-extrabold tracking-tight text-[var(--text-h)]`,children:[`Get in`,` `,(0,y.jsx)(`span`,{style:{backgroundImage:`var(--accent-gradient)`,WebkitBackgroundClip:`text`,WebkitTextFillColor:`transparent`},children:`Touch`})]}),(0,y.jsx)(`p`,{className:`text-[var(--text)] text-lg leading-relaxed max-w-2xl`,children:`Have questions, feedback, or feature requests? We'd love to hear from you.`})]}),(0,y.jsxs)(`div`,{className:`grid grid-cols-1 lg:grid-cols-2 gap-8`,children:[(0,y.jsxs)(`form`,{onSubmit:o,className:`rounded-[var(--radius)] border border-[var(--border)] bg-[var(--bg-surface)] p-6 space-y-5`,children:[(0,y.jsx)(`h2`,{className:`text-lg font-bold text-[var(--text-h)]`,children:`Send a Message`}),n&&(0,y.jsx)(`div`,{className:`px-4 py-3 rounded-lg bg-green-500/10 border border-green-500/30 text-green-600 text-sm font-medium`,children:`Thanks for your message! We'll get back to you soon.`}),(0,y.jsxs)(`div`,{className:`grid grid-cols-1 sm:grid-cols-2 gap-4`,children:[(0,y.jsxs)(`div`,{children:[(0,y.jsx)(`label`,{className:`block text-xs font-medium text-[var(--text)] mb-1`,children:`Name`}),(0,y.jsx)(`input`,{type:`text`,className:Gl,placeholder:`Your name`,value:e.name,onChange:i(`name`)})]}),(0,y.jsxs)(`div`,{children:[(0,y.jsx)(`label`,{className:`block text-xs font-medium text-[var(--text)] mb-1`,children:`Email`}),(0,y.jsx)(`input`,{type:`email`,className:Gl,placeholder:`you@example.com`,value:e.email,onChange:i(`email`)})]})]}),(0,y.jsxs)(`div`,{children:[(0,y.jsx)(`label`,{className:`block text-xs font-medium text-[var(--text)] mb-1`,children:`Subject`}),(0,y.jsx)(`input`,{type:`text`,className:Gl,placeholder:`What is this about?`,value:e.subject,onChange:i(`subject`)})]}),(0,y.jsxs)(`div`,{children:[(0,y.jsx)(`label`,{className:`block text-xs font-medium text-[var(--text)] mb-1`,children:`Message`}),(0,y.jsx)(`textarea`,{rows:5,className:`${Gl} resize-none`,placeholder:`Tell us what's on your mind...`,value:e.message,onChange:i(`message`)})]}),(0,y.jsx)(`button`,{type:`submit`,disabled:!a,className:`px-6 py-2.5 rounded-lg text-sm font-semibold text-white transition-opacity ${a?`cursor-pointer hover:opacity-90`:`opacity-50 cursor-not-allowed`}`,style:{backgroundImage:`var(--accent-gradient)`},children:`Send Message`})]}),(0,y.jsx)(`div`,{className:`space-y-4`,children:Kl.map(e=>(0,y.jsxs)(`div`,{className:`rounded-[var(--radius)] border border-[var(--border)] bg-[var(--bg-surface)] p-5 flex items-start gap-4 transition-colors hover:border-[var(--accent-border)]`,children:[(0,y.jsx)(`span`,{className:`shrink-0 w-9 h-9 rounded-lg flex items-center justify-center text-white`,style:{backgroundImage:`var(--accent-gradient)`},children:e.icon}),(0,y.jsxs)(`div`,{children:[(0,y.jsx)(`p`,{className:`text-xs font-medium text-[var(--text)]`,children:e.label}),(0,y.jsx)(`p`,{className:`text-sm font-semibold text-[var(--text-h)]`,children:e.value})]})]},e.label))})]}),(0,y.jsxs)(`div`,{className:`space-y-4`,children:[(0,y.jsx)(`h2`,{className:`text-xl font-bold text-[var(--text-h)]`,children:`Frequently Asked Questions`}),(0,y.jsx)(`div`,{className:`space-y-2 max-w-3xl`,children:ql.map((e,t)=>(0,y.jsxs)(`div`,{className:`rounded-[var(--radius)] border border-[var(--border)] bg-[var(--bg-surface)] overflow-hidden transition-colors hover:border-[var(--accent-border)]`,children:[(0,y.jsxs)(`button`,{onClick:()=>c(s===t?null:t),className:`w-full flex items-center justify-between px-5 py-4 text-left cursor-pointer`,children:[(0,y.jsx)(`span`,{className:`text-sm font-semibold text-[var(--text-h)]`,children:e.q}),(0,y.jsx)(`svg`,{xmlns:`http://www.w3.org/2000/svg`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:2,strokeLinecap:`round`,strokeLinejoin:`round`,className:`w-4 h-4 text-[var(--text)] shrink-0 ml-4 transition-transform ${s===t?`rotate-180`:``}`,children:(0,y.jsx)(`polyline`,{points:`6 9 12 15 18 9`})})]}),s===t&&(0,y.jsx)(`div`,{className:`px-5 pb-4`,children:(0,y.jsx)(`p`,{className:`text-sm text-[var(--text)] leading-relaxed`,children:e.a})})]},t))})]})]})}function Yl(){return window.matchMedia(`(prefers-color-scheme: dark)`).matches?`dark`:`light`}function Xl(){let[e,t]=(0,_.useState)(()=>{try{let e=localStorage.getItem(`theme`);if(e===`light`||e===`dark`)return e}catch{}return Yl()});return(0,_.useEffect)(()=>{document.documentElement.classList.toggle(`dark`,e===`dark`);try{localStorage.setItem(`theme`,e)}catch{}},[e]),{theme:e,toggle:(0,_.useCallback)(()=>{t(e=>e===`dark`?`light`:`dark`)},[])}}var Zl={home:`Home`,profile:`Profile`,preview:`Preview`,about:`About`,contact:`Contact`},Ql=Object.keys(Zl);var RT_DENY=[`preview`];function RTblockedNow(){try{if(window.RTAccess)return window.RTAccess.blockedTabs();var c=window.RT_ACCESS_CONFIG;return c&&Array.isArray(c.blockedTabs)?c.blockedTabs.slice():RT_DENY.slice()}catch(e){return RT_DENY.slice()}}function RTblockedTab(e){return RTblockedNow().indexOf(e)!==-1}function RTfallbackTab(){try{return window.RTAccess&&window.RTAccess.fallbackTab()||`home`}catch(e){return`home`}}function RTwebhookRequired(){try{return window.RTAccess?!!window.RTAccess.requiresWebhook():!0}catch(e){return!0}}function RTuseBlockedTabs(){let[e,t]=(0,_.useState)(RTblockedNow);return(0,_.useEffect)(()=>{let n=()=>{let r=RTblockedNow();t(e=>e.length===r.length&&e.every((e,t)=>e===r[t])?e:r)},r=window.RTAccess&&window.RTAccess.event||`resume-tailor:access-changed`;return document.addEventListener(r,n),n(),()=>document.removeEventListener(r,n)},[]),e}function $l(){let[e,t]=(0,_.useState)(`home`),RTblocked=RTuseBlockedTabs(),RTtab=RTblocked.includes(e)?RTfallbackTab():e,{theme:n,toggle:r}=Xl(),i=(0,_.useCallback)(e=>{e in Zl&&!RTblockedTab(e)&&t(e)},[RTblocked]);(0,_.useEffect)(()=>{RTtab!==e&&t(RTtab)},[RTtab,e]);return(0,y.jsxs)(`div`,{className:`flex flex-col h-screen overflow-hidden`,children:[(0,y.jsx)(`header`,{className:`shrink-0 border-b border-[var(--border)] bg-[var(--nav-bg)]`,children:(0,y.jsxs)(`nav`,{className:`flex items-center justify-between px-8 py-3`,children:[(0,y.jsx)(`div`,{className:`text-lg font-bold tracking-tight cursor-pointer text-[var(--text-h)]`,onClick:()=>t(`home`),children:`Resume Tailor`}),(0,y.jsxs)(`div`,{className:`flex items-center gap-1`,children:[Ql.filter(e=>!RTblocked.includes(e)).map(n=>(0,y.jsx)(`button`,{onClick:()=>t(n),className:`px-4 py-1.5 rounded-lg text-sm font-medium transition-colors cursor-pointer ${RTtab===n?`text-white`:`text-[var(--text)] hover:bg-[var(--accent-bg)] hover:text-[var(--accent)]`}`,style:RTtab===n?{backgroundImage:`var(--accent-gradient)`}:void 0,children:Zl[n]},n)),(0,y.jsx)(`div`,{className:`w-px h-5 bg-[var(--border)] mx-2`}),(0,y.jsx)(`button`,{onClick:r,className:`p-2 rounded-lg text-[var(--text)] hover:bg-[var(--accent-bg)] hover:text-[var(--accent)] transition-colors cursor-pointer`,"aria-label":`Switch to ${n===`dark`?`light`:`dark`} mode`,title:`Switch to ${n===`dark`?`light`:`dark`} mode`,children:n===`dark`?(0,y.jsxs)(`svg`,{width:`18`,height:`18`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`2`,strokeLinecap:`round`,strokeLinejoin:`round`,children:[(0,y.jsx)(`circle`,{cx:`12`,cy:`12`,r:`5`}),(0,y.jsx)(`line`,{x1:`12`,y1:`1`,x2:`12`,y2:`3`}),(0,y.jsx)(`line`,{x1:`12`,y1:`21`,x2:`12`,y2:`23`}),(0,y.jsx)(`line`,{x1:`4.22`,y1:`4.22`,x2:`5.64`,y2:`5.64`}),(0,y.jsx)(`line`,{x1:`18.36`,y1:`18.36`,x2:`19.78`,y2:`19.78`}),(0,y.jsx)(`line`,{x1:`1`,y1:`12`,x2:`3`,y2:`12`}),(0,y.jsx)(`line`,{x1:`21`,y1:`12`,x2:`23`,y2:`12`}),(0,y.jsx)(`line`,{x1:`4.22`,y1:`19.78`,x2:`5.64`,y2:`18.36`}),(0,y.jsx)(`line`,{x1:`18.36`,y1:`5.64`,x2:`19.78`,y2:`4.22`})]}):(0,y.jsx)(`svg`,{width:`18`,height:`18`,viewBox:`0 0 24 24`,fill:`none`,stroke:`currentColor`,strokeWidth:`2`,strokeLinecap:`round`,strokeLinejoin:`round`,children:(0,y.jsx)(`path`,{d:`M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z`})})})]})]})}),(0,y.jsxs)(`main`,{className:`flex-1 min-h-0 overflow-auto`,children:[RTtab===`home`&&(0,y.jsx)(C,{onNavigate:i}),RTtab===`profile`&&(0,y.jsx)(I,{}),RTtab===`preview`&&(0,y.jsx)(Bl,{}),RTtab===`about`&&(0,y.jsx)(Wl,{}),RTtab===`contact`&&(0,y.jsx)(Jl,{})]}),(0,y.jsxs)(`footer`,{className:`shrink-0 border-t border-[var(--border)] bg-[var(--footer-bg)] px-8 py-3 flex items-center justify-between text-xs text-[var(--text)]`,children:[(0,y.jsxs)(`span`,{children:[`© `,new Date().getFullYear(),` Resume Tailor`]}),(0,y.jsx)(`span`,{children:`Designed & Developed by Akira`})]})]})}(0,g.createRoot)(document.getElementById(`root`)).render((0,y.jsx)(_.StrictMode,{children:(0,y.jsx)($l,{})}));export{o as n,c as r,L as t};

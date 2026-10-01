@@ -8,8 +8,13 @@
  * with nothing selected no request is made. Events are still logged to the
  * console and dispatched as DOM events either way.
  *
- * This file is plain JS (not part of the compiled bundle), so the list can be
- * edited here or through GitHub's web UI without rebuilding anything.
+ * This file is the editable source of truth for the list, but it is NO LONGER
+ * served on its own - it is baked into the app bundle alongside the access
+ * guard, so neither can be defeated by blocking a request. After editing, run:
+ *
+ *     node embed-access.mjs && node stamp-cache-version.mjs
+ *
+ * Editing it through GitHub's web UI alone will NOT change the live page.
  *
  * Each event sends: the profile name, the target company (resume.generated),
  * the user's public IP address and country (see clientInfo below), and counts

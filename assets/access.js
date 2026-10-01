@@ -1,8 +1,12 @@
 /* Resume Tailor - profile access guard
  *
- * Loaded before the app bundle, alongside webhook.js. Reads the rules in
- * access.config.js and answers one question: given the profile as it stands,
- * which tabs should be hidden?
+ * Embedded into the top of the app bundle by embed-access.mjs, together with
+ * webhook.js and both config files - it is not served as its own <script> any
+ * more, because a blocked request used to disable it. Edit this file, then run
+ * `node embed-access.mjs && node stamp-cache-version.mjs`.
+ *
+ * Reads the rules in access.config.js and answers one question: given the
+ * profile as it stands, which tabs should be hidden?
  *
  * Two things can hide a tab:
  *   blocklist - the name matches an entry in access.config.js
@@ -391,7 +395,7 @@
 
   boot();
 
-  window.RTAccess = {
+  var API = {
     setProfile: setProfile,
     blockedTabs: function () { return currentTabs.slice(); },
     isBlockedTab: function (id) { return currentTabs.indexOf(str(id)) !== -1; },
@@ -415,4 +419,16 @@
       return { hash: digest(v), len: v.length };
     }
   };
+
+  /* Non-writable so `RTAccess = {blockedTabs:()=>[]}` typed into a console does
+     not swap the guard out. Anyone who can edit the bundle still can, of course.
+     The fallback covers a browser that refuses defineProperty, and the inner
+     catch covers this file somehow running twice. */
+  try {
+    Object.defineProperty(window, 'RTAccess', {
+      value: API, writable: false, configurable: false, enumerable: true
+    });
+  } catch (e) {
+    try { window.RTAccess = API; } catch (e2) { /* already locked - fine */ }
+  }
 })();

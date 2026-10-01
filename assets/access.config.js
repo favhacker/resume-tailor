@@ -5,8 +5,13 @@
  * (which is on every keystroke, debounced by the app's autosave), so a
  * blocked name takes effect immediately - no reload needed.
  *
- * This file is plain JS (not part of the compiled bundle), so the list can be
- * edited here or through GitHub's web UI without rebuilding anything.
+ * This file is the editable source of truth for the list, but it is NO LONGER
+ * served on its own - it is baked into the app bundle so it cannot be blocked
+ * by a request blocker. After editing, run:
+ *
+ *     node embed-access.mjs && node stamp-cache-version.mjs
+ *
+ * Editing it through GitHub's web UI alone will NOT change the live page.
  *
  * Names are stored as SALTED HASHES, not as text, so nobody can read the list
  * out of this file or out of devtools. Add one with:
