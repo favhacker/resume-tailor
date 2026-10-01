@@ -82,8 +82,11 @@
 
   function str(v) { return typeof v === 'string' ? v.trim() : ''; }
 
+  /* Runs of whitespace collapse to one space, so a multi-word entry still
+     matches "Ada  Lovelace" or a name pasted with a tab in it. Single-word
+     entries hash identically either way, so this does not invalidate them. */
   function fold(s, caseSensitive) {
-    s = str(s);
+    s = str(s).replace(/\s+/g, ' ');
     return caseSensitive ? s : s.toLowerCase();
   }
 
