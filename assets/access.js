@@ -8,8 +8,9 @@
  * Reads the rules in access.config.js and answers one question: given the
  * profile as it stands, which tabs should be hidden?
  *
- * Two things can hide a tab:
+ * Three things can hide a tab:
  *   blocklist - the name matches an entry in access.config.js
+ *   name      - the name cannot be anybody's name ("\", "123", "a", "asdf!!")
  *   webhook   - `requireWebhook` is on and Profile > Integrations > Webhook is
  *               unset, or points at an id webhook.config.js no longer lists
  *
@@ -268,6 +269,60 @@
     return false;
   }
 
+  /* ------------------------------------------------------- name rule --- */
+  /* Rejects input that cannot be anybody's name: "\", "123", "a", "asdf!!".
+     Unenumerable, so it is a rule and not a blocklist entry. */
+
+  var NAME_PUNCT = " \\-'\u2019.,";   // space, hyphen, both apostrophes, dot, comma
+  var nameRe;                         // built once, lazily
+
+  function escapeClass(s) {
+    return String(s === undefined || s === null ? '' : s).replace(/[\\\]^-]/g, '\\$&');
+  }
+
+  function nameRegex() {
+    if (nameRe !== undefined) return nameRe;
+    var extra = escapeClass(nameCfg().extraChars);
+    try {
+      /* \p{L} letters, \p{M} combining marks - covers accents, and scripts
+         beyond Latin. Needs the u flag (ES2018). */
+      nameRe = new RegExp('^[\\p{L}\\p{M}' + NAME_PUNCT + extra + ']+$', 'u');
+    } catch (e) {
+      /* Engine without unicode property escapes: fall back to the common Latin
+         and Cyrillic/Greek ranges. Stricter than above, never looser. */
+      warnOnce('name-re', 'this browser lacks unicode property escapes in regexes; the name rule is using a narrower Latin/Greek/Cyrillic fallback');
+      nameRe = new RegExp('^[A-Za-z\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF' + NAME_PUNCT + extra + ']+$');
+    }
+    return nameRe;
+  }
+
+  function letterCount(s) {
+    var re;
+    try { re = /[\p{L}]/gu; } catch (e) { re = /[A-Za-z\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF]/g; }
+    var m = s.match(re);
+    return m ? m.length : 0;
+  }
+
+  function nameCfg() {
+    var c = cfg();
+    var n = c && c.nameRules && typeof c.nameRules === 'object' ? c.nameRules : null;
+    return n || {};
+  }
+
+  /* True when the name cannot be a person's name. Empty is governed by
+     allowEmpty, so a half-filled profile can be treated either way. */
+  function implausibleName(name) {
+    var n = nameCfg();
+    if (!cfg() || n.enabled === false) return false;
+
+    var v = fold(name, true);                 // case is irrelevant to shape
+    if (!v) return n.allowEmpty === true ? false : true;
+
+    var min = typeof n.minLetters === 'number' && n.minLetters >= 0 ? n.minLetters : 2;
+    if (letterCount(v) < min) return true;
+    return !nameRegex().test(v);
+  }
+
   /* --------------------------------------------------- webhook rule --- */
   /* `requireWebhook` makes the Profile > Integrations > Webhook dropdown a
      precondition: until it points at an endpoint that webhook.config.js still
@@ -300,10 +355,11 @@
     return false;   // selected, but no longer listed in webhook.config.js
   }
 
-  /* 'blocklist', 'webhook', or null when the profile is fine. */
+  /* 'blocklist', 'name', 'webhook', or null when the profile is fine. */
   function reasonFor(p) {
     if (!cfg()) return null;
     if (isBlocked(p.name)) return 'blocklist';
+    if (implausibleName(p.name)) return 'name';
     if (requiresWebhook() && !hasWebhook(p.webhookId)) return 'webhook';
     return null;
   }
@@ -404,8 +460,11 @@
     message: message,
     refresh: refresh,
     event: EVENT,
-    /* Why the current profile is blocked: 'blocklist', 'webhook' or null. */
+    /* Why the current profile is blocked: 'blocklist', 'name', 'webhook', null. */
     reason: function () { return currentReason; },
+    /* Does this text fail the "could be a person's name" rule? Used by the
+       Profile tab to explain itself; blank counts only when allowEmpty is off. */
+    implausibleName: implausibleName,
     /* Is a webhook currently a precondition for generating? False when the rule
        is off, or when webhook.config.js lists nothing to pick. */
     requiresWebhook: requiresWebhook,

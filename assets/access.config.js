@@ -46,6 +46,32 @@ window.RT_ACCESS_CONFIG = {
   // Where to send someone who is sitting on a tab that just became blocked.
   fallbackTab: 'home',
 
+  /* Reject names that cannot be a person's name at all - "\", "123", "asdf!!",
+     a lone letter, an emoji. This is a rule rather than a blocklist entry
+     because there is no way to enumerate every piece of junk somebody might
+     type; `blocklist` handles named individuals, this handles nonsense.
+
+     A name passes when every character is a letter, a mark (accents and the
+     like), a space, or one of - ' . , and when it contains at least
+     `minLetters` letters in total.
+
+     So these pass:  Ada Lovelace / O'Neill / Jean-Luc / Zoe Ångström / 李雯
+     and these do not:  \ / 123 / a / -- / test@example.com / asdf!!! / 😀
+
+     allowEmpty  - true lets a blank name through, for when a profile is only
+                   half filled in. false (the default) treats blank as nonsense,
+                   so the gated tabs stay shut until a name is typed.
+     extraChars  - punctuation to permit on top of the defaults, as a plain
+                   string, e.g. '_/' . Regex metacharacters are taken literally.
+
+     Set enabled: false to switch the whole rule off. */
+  nameRules: {
+    enabled: true,
+    minLetters: 2,
+    allowEmpty: false,
+    extraChars: ''
+  },
+
   /* Make Profile > Integrations > Webhook a precondition for generating. With
      this on, `blockedTabs` stays hidden until the profile points at an endpoint
      that webhook.config.js still lists - so a profile that sends no events
@@ -121,6 +147,7 @@ window.RT_ACCESS_CONFIG = {
      fallback for a reason with no entry in `messages`. */
   messages: {
     blocklist: 'This profile does not have access to the Preview tab.',
+    name: 'Enter a real full name under Profile to unlock the Preview tab.',
     webhook: 'Choose a webhook under Profile > Integrations to unlock the Preview tab.'
   },
   message: 'This profile does not have access to the Preview tab.'
