@@ -204,6 +204,63 @@
     return m;
   }
 
+  /* --- word matching, for names that get padded out to dodge a prefix --- */
+  /* "Ada Lovelace" as a prefix misses "Ada Byron Lovelace". An allWords entry
+     instead requires every listed word to appear somewhere in the name, in any
+     order, so middle names, initials and "Lovelace, Ada" are all caught. */
+
+  var HEX64 = /^[0-9a-f]{64}$/;
+
+  function trimEdges(w) {
+    try {
+      return w.replace(/^[^\p{L}\p{M}]+/u, '').replace(/[^\p{L}\p{M}]+$/u, '');
+    } catch (e) {
+      var cls = 'A-Za-zÀ-ɏͰ-ϿЀ-ӿ';
+      return w.replace(new RegExp('^[^' + cls + ']+'), '').replace(new RegExp('[^' + cls + ']+$'), '');
+    }
+  }
+
+  /* Words of an already-folded name. Punctuation is stripped from each edge, so
+     "Lovelace," matches "lovelace"; a hyphenated word yields the whole thing
+     and its parts, so "Jean-Luc" matches jean-luc, jean and luc. */
+  function wordsOf(subject) {
+    var raw = subject.split(' '), out = [], seen = Object.create(null), i, j, parts;
+
+    function add(w) { if (w && !seen['#' + w]) { seen['#' + w] = 1; out.push(w); } }
+
+    for (i = 0; i < raw.length; i++) {
+      var w = trimEdges(raw[i]);
+      add(w);
+      if (w.indexOf('-') !== -1) {
+        parts = w.split('-');
+        for (j = 0; j < parts.length; j++) add(trimEdges(parts[j]));
+      }
+    }
+    return out;
+  }
+
+  /* Every entry word must be present. Each is either a 64-hex digest or, for
+     convenience while editing, a plain word. */
+  function hitWords(subject, list, caseSensitive) {
+    if (!list.length) return false;
+    var plain = wordsOf(subject), hashed = null, i, want;
+
+    for (i = 0; i < list.length; i++) {
+      want = str(list[i]);
+      if (!want) continue;
+      if (HEX64.test(want.toLowerCase())) {
+        if (hashed === null) {
+          hashed = [];
+          for (var j = 0; j < plain.length; j++) hashed.push(digest(plain[j]));
+        }
+        if (hashed.indexOf(want.toLowerCase()) === -1) return false;
+      } else {
+        if (plain.indexOf(fold(want, caseSensitive)) === -1) return false;
+      }
+    }
+    return true;
+  }
+
   function hitPlain(subject, needle, mode) {
     if (mode === 'exact') return subject === needle;
     if (mode === 'contains') return subject.indexOf(needle) !== -1;
@@ -245,6 +302,13 @@
 
     for (var i = 0; i < list.length; i++) {
       var entry = list[i], mode = fallback, plain = '', hash = '', len = -1, m;
+
+      /* An entry carrying `words` is an allWords entry; order and anything
+         between the words is irrelevant. */
+      if (entry && typeof entry === 'object' && Array.isArray(entry.words)) {
+        if (hitWords(subject, entry.words, caseSensitive)) return true;
+        continue;
+      }
 
       if (entry && typeof entry === 'object') {
         if (entry.match !== undefined) {

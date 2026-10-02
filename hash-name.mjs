@@ -5,8 +5,14 @@
  * into the line you paste into that file.
  *
  *     node hash-name.mjs "Some Name" "Another Name"
+ *     node hash-name.mjs --words "First Last"  # match these words in any order
  *     node hash-name.mjs --new-salt        # print a fresh random salt
  *     node hash-name.mjs --check "Some Name"   # is this name blocked right now?
+ *
+ * --words is the one to reach for when somebody pads their name out to dodge a
+ * prefix entry: `--words "First Last"` blocks "First Last", "First M Last",
+ * "First Middle Last" and "Last, First" alike, while leaving anyone who shares
+ * only one of the two words alone.
  *
  * It reads the salt, hashIterations and caseSensitive already in
  * access.config.js and uses the same hashing code the page uses, so what it
@@ -75,6 +81,23 @@ if (check) {
   for (const name of names) {
     console.log(`${isBlocked(name) ? 'BLOCKED' : 'allowed'}  ${JSON.stringify(name)}`);
   }
+  process.exit(0);
+}
+
+if (args.includes('--words')) {
+  console.log(`salt set: ${!!String(cfg.salt || '').trim()}   hashIterations: ${cfg.hashIterations ?? 1}   caseSensitive: ${cfg.caseSensitive === true}\n`);
+  console.log('Paste into the `blocklist` array in assets/access.config.js:\n');
+  for (const name of names) {
+    const parts = name.split(/\s+/).map((w) => w.trim()).filter(Boolean);
+    if (parts.length < 2) {
+      console.error(`  "${name}" is a single word — use a normal entry instead, or allWords will block everyone who shares it.`);
+      continue;
+    }
+    const hashes = parts.map((w) => `'${hash(w).hash}'`);
+    console.log(`    { words: [${hashes.join(', ')}], note: '' },`);
+  }
+  console.log('\nEvery word must appear for the entry to match, in any order.');
+  console.log("Drop the trailing comma on the last entry and fill in `note`.");
   process.exit(0);
 }
 
