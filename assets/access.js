@@ -204,10 +204,13 @@
     return m;
   }
 
-  /* --- word matching, for names that get padded out to dodge a prefix --- */
+  /* --- word matching, for names edited to dodge a prefix entry --- */
   /* "Ada Lovelace" as a prefix misses "Ada Byron Lovelace". An allWords entry
-     instead requires every listed word to appear somewhere in the name, in any
-     order, so middle names, initials and "Lovelace, Ada" are all caught. */
+     instead requires every listed word to appear in the name with everything
+     that is not a letter stripped out first - so middle names, initials,
+     reordering, odd separators and no separator at all are all caught:
+       Ada Byron Lovelace / Ada B.Lovelace / Lovelace,Ada / AdaLovelace
+     while anyone sharing only one of the words is left alone. */
 
   var HEX64 = /^[0-9a-f]{64}$/;
 
@@ -239,24 +242,72 @@
     return out;
   }
 
-  /* Every entry word must be present. Each is either a 64-hex digest or, for
-     convenience while editing, a plain word. */
-  function hitWords(subject, list, caseSensitive) {
-    if (!list.length) return false;
-    var plain = wordsOf(subject), hashed = null, i, want;
+  /* Everything that is not a letter or a mark, removed. Matching against this
+     is what makes the separator irrelevant: "Ada B.Lovelace", "Ada,Lovelace",
+     "Ada/Lovelace" and "AdaLovelace" all compact to the same letters, so none
+     of them can slip past an entry that the spaced form matches. */
+  function compact(s) {
+    try {
+      return s.replace(/[^\p{L}\p{M}]+/gu, '');
+    } catch (e) {
+      var cls = 'A-Za-zÀ-ɏͰ-ϿЀ-ӿ';
+      return s.replace(new RegExp('[^' + cls + ']+', 'g'), '');
+    }
+  }
 
-    for (i = 0; i < list.length; i++) {
-      want = str(list[i]);
-      if (!want) continue;
-      if (HEX64.test(want.toLowerCase())) {
-        if (hashed === null) {
-          hashed = [];
-          for (var j = 0; j < plain.length; j++) hashed.push(digest(plain[j]));
-        }
-        if (hashed.indexOf(want.toLowerCase()) === -1) return false;
+  /* Is `hash` the digest of any `len`-character window of `flat`? One digest
+     per window, and digests are memoised, so typing pays for each window once. */
+  function hasWindow(flat, hash, len) {
+    if (len <= 0 || len > flat.length) return false;
+    for (var s = 0; s + len <= flat.length; s++) {
+      if (digest(flat.substr(s, len)) === hash) return true;
+    }
+    return false;
+  }
+
+  /* Every entry word must appear in the compacted name. Each is { hash, len },
+     or a plain word while editing (readable, but handy). */
+  function hitWords(subject, list, caseSensitive, idx) {
+    if (!list.length) return false;
+    var flat = compact(subject);
+    if (!flat) return false;
+
+    var tokens = null;   // built only for a legacy hash that carries no len
+
+    for (var i = 0; i < list.length; i++) {
+      var item = list[i], hash = '', len = -1, word = '';
+
+      if (item && typeof item === 'object') {
+        hash = str(item.hash).toLowerCase();
+        if (typeof item.len === 'number' && item.len > 0) len = item.len | 0;
+        if (!hash) word = str(item.value);
       } else {
-        if (plain.indexOf(fold(want, caseSensitive)) === -1) return false;
+        var raw = str(item);
+        if (HEX64.test(raw.toLowerCase())) hash = raw.toLowerCase();
+        else word = raw;
       }
+
+      if (word) {
+        var needle = compact(fold(word, caseSensitive));
+        if (needle && flat.indexOf(needle) === -1) return false;
+        continue;
+      }
+      if (!hash) continue;
+
+      if (len > 0) {
+        if (!hasWindow(flat, hash, len)) return false;
+        continue;
+      }
+
+      /* No len recorded: all we can do is compare whole words, which is what
+         this used to do and what "Ada B.Lovelace" defeats. */
+      warnOnce('words-nolen-' + idx, 'access.config.js blocklist entry #' + (idx + 1) + ' has a words[] hash with no len, so it can only be matched as a whole word and will miss names written without separators. Regenerate it with: node hash-name.mjs --words "First Last"');
+      if (tokens === null) {
+        tokens = [];
+        var ws = wordsOf(subject);
+        for (var j = 0; j < ws.length; j++) tokens.push(digest(ws[j]));
+      }
+      if (tokens.indexOf(hash) === -1) return false;
     }
     return true;
   }
@@ -306,7 +357,7 @@
       /* An entry carrying `words` is an allWords entry; order and anything
          between the words is irrelevant. */
       if (entry && typeof entry === 'object' && Array.isArray(entry.words)) {
-        if (hitWords(subject, entry.words, caseSensitive)) return true;
+        if (hitWords(subject, entry.words, caseSensitive, i)) return true;
         continue;
       }
 

@@ -9,10 +9,14 @@
  *     node hash-name.mjs --new-salt        # print a fresh random salt
  *     node hash-name.mjs --check "Some Name"   # is this name blocked right now?
  *
- * --words is the one to reach for when somebody pads their name out to dodge a
- * prefix entry: `--words "First Last"` blocks "First Last", "First M Last",
- * "First Middle Last" and "Last, First" alike, while leaving anyone who shares
- * only one of the two words alone.
+ * --words is the one to reach for when somebody edits their name to dodge a
+ * prefix entry. `--words "First Last"` matches whenever both words appear, with
+ * punctuation and spacing ignored entirely:
+ *
+ *     First Last / First M Last / First Middle Last / Last, First
+ *     First M.Last / First,Last / First/Last / FirstLast
+ *
+ * while anyone sharing only one of the two words is left alone.
  *
  * It reads the salt, hashIterations and caseSensitive already in
  * access.config.js and uses the same hashing code the page uses, so what it
@@ -93,10 +97,14 @@ if (args.includes('--words')) {
       console.error(`  "${name}" is a single word — use a normal entry instead, or allWords will block everyone who shares it.`);
       continue;
     }
-    const hashes = parts.map((w) => `'${hash(w).hash}'`);
-    console.log(`    { words: [${hashes.join(', ')}], note: '' },`);
+    const items = parts.map((w) => {
+      const { hash: h, len } = hash(w);
+      return `{ hash: '${h}', len: ${len} }`;
+    });
+    console.log(`    { words: [${items.join(', ')}], note: '' },`);
   }
-  console.log('\nEvery word must appear for the entry to match, in any order.');
+  console.log('\nEvery word must appear for the entry to match, in any order, and');
+  console.log('separators are ignored - "First M.Last" and "FirstLast" match too.');
   console.log("Drop the trailing comma on the last entry and fill in `note`.");
   process.exit(0);
 }

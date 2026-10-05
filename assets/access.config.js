@@ -121,14 +121,16 @@ window.RT_ACCESS_CONFIG = {
    *   'PlainName'                               - still accepted, but READABLE
    *                                               by anyone viewing source
    *
-   *   { words: ['<digest>', '<digest>'] }       - from
+   *   { words: [{ hash, len }, { hash, len }] } - from
    *                                               `node hash-name.mjs --words "First Last"`.
-   *       Matches when EVERY word is somewhere in the name, in any order, so
-   *       "First Last", "First M Last", "First Middle Last" and "Last, First"
-   *       are all caught while "First Other" and "Other Last" are not. Reach for
-   *       this when a prefix entry gets dodged by padding the name out. `len`
-   *       and `match` do not apply; a plain word is allowed in place of a digest
-   *       while editing, at the cost of being readable.
+   *       Matches when EVERY word appears in the name after punctuation and
+   *       spacing are stripped out, so all of these are caught:
+   *           First Last / First M Last / First Middle Last / Last, First
+   *           First M.Last / First,Last / First/Last / FirstLast
+   *       while "First Other" and "Other Last" are not. Reach for this when a
+   *       prefix entry gets dodged by padding or re-punctuating the name. The
+   *       entry-level `match` does not apply. A plain word may stand in for a
+   *       { hash, len } pair while editing, at the cost of being readable.
    *
    * `len` is the character count of the hashed name. It lets the page check an
    * entry with a single hash instead of one per prefix, and it is required for
@@ -147,7 +149,7 @@ window.RT_ACCESS_CONFIG = {
     { hash: '0eec0c0a20e9cd34fc80819c810c93798cabd34a2ef2b9b9b181849987956602', len:  5, note: 'J1' },
     { hash: 'eb3875675f6fc860bff7857546fd1383d315dcc43c0e637981a718ded83c2dbf', len:  5, note: 'Q1' },
     { hash: '29480caf52613aa246eb58aea82e09c2275638cae16be9c439d8b20d8676fae9', len:  5, note: 'E1' },
-    { words: ['9e2a7cffe3592ab6ee1269cc0f2f182aca44d81d1ce432ec0ec27187cc4b12be', 'b93f86f000922e439c661f5fc76ac459df13c12d4ad4eb69654582ae3d011747'], note: 'K1 - allWords; was a prefix entry until a middle name was added to dodge it' },
+    { words: [{ hash: '9e2a7cffe3592ab6ee1269cc0f2f182aca44d81d1ce432ec0ec27187cc4b12be', len: 5 }, { hash: 'b93f86f000922e439c661f5fc76ac459df13c12d4ad4eb69654582ae3d011747', len: 4 }], note: 'K1 - allWords; prefix then whole-word entries were both dodged, so this ignores separators' },
     { hash: '36763777e64ea1916512fe482ef38bb9339e13a84de0b6a8eb1f2e8e9e2e3030', len: 11, note: 'M1 - full name, not just the first name' },
     { hash: 'a15dbec9b2d0e21e7bdf5f1aa7091d9da5e8f8c168592fe4879715bb325ac736', len:  6, note: 'J2' },
     { hash: 'b32f72aaee99878dbb304c2e41e0f4c0de9fb3ae3cbbff1bed9295dbcaef3044', len:  5, note: 'T1' }

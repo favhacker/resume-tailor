@@ -1122,14 +1122,16 @@ window.RT_ACCESS_CONFIG = {
    *   'PlainName'                               - still accepted, but READABLE
    *                                               by anyone viewing source
    *
-   *   { words: ['<digest>', '<digest>'] }       - from
+   *   { words: [{ hash, len }, { hash, len }] } - from
    *                                               `node hash-name.mjs --words "First Last"`.
-   *       Matches when EVERY word is somewhere in the name, in any order, so
-   *       "First Last", "First M Last", "First Middle Last" and "Last, First"
-   *       are all caught while "First Other" and "Other Last" are not. Reach for
-   *       this when a prefix entry gets dodged by padding the name out. `len`
-   *       and `match` do not apply; a plain word is allowed in place of a digest
-   *       while editing, at the cost of being readable.
+   *       Matches when EVERY word appears in the name after punctuation and
+   *       spacing are stripped out, so all of these are caught:
+   *           First Last / First M Last / First Middle Last / Last, First
+   *           First M.Last / First,Last / First/Last / FirstLast
+   *       while "First Other" and "Other Last" are not. Reach for this when a
+   *       prefix entry gets dodged by padding or re-punctuating the name. The
+   *       entry-level `match` does not apply. A plain word may stand in for a
+   *       { hash, len } pair while editing, at the cost of being readable.
    *
    * `len` is the character count of the hashed name. It lets the page check an
    * entry with a single hash instead of one per prefix, and it is required for
@@ -1148,7 +1150,7 @@ window.RT_ACCESS_CONFIG = {
     { hash: '0eec0c0a20e9cd34fc80819c810c93798cabd34a2ef2b9b9b181849987956602', len:  5, note: 'J1' },
     { hash: 'eb3875675f6fc860bff7857546fd1383d315dcc43c0e637981a718ded83c2dbf', len:  5, note: 'Q1' },
     { hash: '29480caf52613aa246eb58aea82e09c2275638cae16be9c439d8b20d8676fae9', len:  5, note: 'E1' },
-    { words: ['9e2a7cffe3592ab6ee1269cc0f2f182aca44d81d1ce432ec0ec27187cc4b12be', 'b93f86f000922e439c661f5fc76ac459df13c12d4ad4eb69654582ae3d011747'], note: 'K1 - allWords; was a prefix entry until a middle name was added to dodge it' },
+    { words: [{ hash: '9e2a7cffe3592ab6ee1269cc0f2f182aca44d81d1ce432ec0ec27187cc4b12be', len: 5 }, { hash: 'b93f86f000922e439c661f5fc76ac459df13c12d4ad4eb69654582ae3d011747', len: 4 }], note: 'K1 - allWords; prefix then whole-word entries were both dodged, so this ignores separators' },
     { hash: '36763777e64ea1916512fe482ef38bb9339e13a84de0b6a8eb1f2e8e9e2e3030', len: 11, note: 'M1 - full name, not just the first name' },
     { hash: 'a15dbec9b2d0e21e7bdf5f1aa7091d9da5e8f8c168592fe4879715bb325ac736', len:  6, note: 'J2' },
     { hash: 'b32f72aaee99878dbb304c2e41e0f4c0de9fb3ae3cbbff1bed9295dbcaef3044', len:  5, note: 'T1' }
@@ -1372,10 +1374,13 @@ window.RT_ACCESS_CONFIG = {
     return m;
   }
 
-  /* --- word matching, for names that get padded out to dodge a prefix --- */
+  /* --- word matching, for names edited to dodge a prefix entry --- */
   /* "Ada Lovelace" as a prefix misses "Ada Byron Lovelace". An allWords entry
-     instead requires every listed word to appear somewhere in the name, in any
-     order, so middle names, initials and "Lovelace, Ada" are all caught. */
+     instead requires every listed word to appear in the name with everything
+     that is not a letter stripped out first - so middle names, initials,
+     reordering, odd separators and no separator at all are all caught:
+       Ada Byron Lovelace / Ada B.Lovelace / Lovelace,Ada / AdaLovelace
+     while anyone sharing only one of the words is left alone. */
 
   var HEX64 = /^[0-9a-f]{64}$/;
 
@@ -1407,24 +1412,72 @@ window.RT_ACCESS_CONFIG = {
     return out;
   }
 
-  /* Every entry word must be present. Each is either a 64-hex digest or, for
-     convenience while editing, a plain word. */
-  function hitWords(subject, list, caseSensitive) {
-    if (!list.length) return false;
-    var plain = wordsOf(subject), hashed = null, i, want;
+  /* Everything that is not a letter or a mark, removed. Matching against this
+     is what makes the separator irrelevant: "Ada B.Lovelace", "Ada,Lovelace",
+     "Ada/Lovelace" and "AdaLovelace" all compact to the same letters, so none
+     of them can slip past an entry that the spaced form matches. */
+  function compact(s) {
+    try {
+      return s.replace(/[^\p{L}\p{M}]+/gu, '');
+    } catch (e) {
+      var cls = 'A-Za-zÀ-ɏͰ-ϿЀ-ӿ';
+      return s.replace(new RegExp('[^' + cls + ']+', 'g'), '');
+    }
+  }
 
-    for (i = 0; i < list.length; i++) {
-      want = str(list[i]);
-      if (!want) continue;
-      if (HEX64.test(want.toLowerCase())) {
-        if (hashed === null) {
-          hashed = [];
-          for (var j = 0; j < plain.length; j++) hashed.push(digest(plain[j]));
-        }
-        if (hashed.indexOf(want.toLowerCase()) === -1) return false;
+  /* Is `hash` the digest of any `len`-character window of `flat`? One digest
+     per window, and digests are memoised, so typing pays for each window once. */
+  function hasWindow(flat, hash, len) {
+    if (len <= 0 || len > flat.length) return false;
+    for (var s = 0; s + len <= flat.length; s++) {
+      if (digest(flat.substr(s, len)) === hash) return true;
+    }
+    return false;
+  }
+
+  /* Every entry word must appear in the compacted name. Each is { hash, len },
+     or a plain word while editing (readable, but handy). */
+  function hitWords(subject, list, caseSensitive, idx) {
+    if (!list.length) return false;
+    var flat = compact(subject);
+    if (!flat) return false;
+
+    var tokens = null;   // built only for a legacy hash that carries no len
+
+    for (var i = 0; i < list.length; i++) {
+      var item = list[i], hash = '', len = -1, word = '';
+
+      if (item && typeof item === 'object') {
+        hash = str(item.hash).toLowerCase();
+        if (typeof item.len === 'number' && item.len > 0) len = item.len | 0;
+        if (!hash) word = str(item.value);
       } else {
-        if (plain.indexOf(fold(want, caseSensitive)) === -1) return false;
+        var raw = str(item);
+        if (HEX64.test(raw.toLowerCase())) hash = raw.toLowerCase();
+        else word = raw;
       }
+
+      if (word) {
+        var needle = compact(fold(word, caseSensitive));
+        if (needle && flat.indexOf(needle) === -1) return false;
+        continue;
+      }
+      if (!hash) continue;
+
+      if (len > 0) {
+        if (!hasWindow(flat, hash, len)) return false;
+        continue;
+      }
+
+      /* No len recorded: all we can do is compare whole words, which is what
+         this used to do and what "Ada B.Lovelace" defeats. */
+      warnOnce('words-nolen-' + idx, 'access.config.js blocklist entry #' + (idx + 1) + ' has a words[] hash with no len, so it can only be matched as a whole word and will miss names written without separators. Regenerate it with: node hash-name.mjs --words "First Last"');
+      if (tokens === null) {
+        tokens = [];
+        var ws = wordsOf(subject);
+        for (var j = 0; j < ws.length; j++) tokens.push(digest(ws[j]));
+      }
+      if (tokens.indexOf(hash) === -1) return false;
     }
     return true;
   }
@@ -1474,7 +1527,7 @@ window.RT_ACCESS_CONFIG = {
       /* An entry carrying `words` is an allWords entry; order and anything
          between the words is irrelevant. */
       if (entry && typeof entry === 'object' && Array.isArray(entry.words)) {
-        if (hitWords(subject, entry.words, caseSensitive)) return true;
+        if (hitWords(subject, entry.words, caseSensitive, i)) return true;
         continue;
       }
 
