@@ -49,7 +49,10 @@ if (args.includes('--new-salt')) {
 }
 
 const check = args.includes('--check');
-const names = args.filter((a) => !a.startsWith('--'));
+
+// Positional args are names. --min takes a value, so skip the token after it.
+const minIndex = args.indexOf('--min');
+const names = args.filter((a, i) => !a.startsWith('--') && !(minIndex !== -1 && i === minIndex + 1));
 
 if (names.length === 0) {
   console.error('Usage: node hash-name.mjs "Some Name" ["Another Name" ...]');
@@ -89,6 +92,14 @@ if (check) {
 }
 
 if (args.includes('--words')) {
+  // --min N : how many of the words must appear. Default is all of them.
+  const mi = args.indexOf('--min');
+  const min = mi !== -1 ? parseInt(args[mi + 1], 10) : 0;
+  if (mi !== -1 && !(min >= 1)) {
+    console.error('--min needs a number of 1 or more, e.g. --min 2');
+    process.exit(1);
+  }
+
   console.log(`salt set: ${!!String(cfg.salt || '').trim()}   hashIterations: ${cfg.hashIterations ?? 1}   caseSensitive: ${cfg.caseSensitive === true}\n`);
   console.log('Paste into the `blocklist` array in assets/access.config.js:\n');
   for (const name of names) {
@@ -97,14 +108,27 @@ if (args.includes('--words')) {
       console.error(`  "${name}" is a single word — use a normal entry instead, or allWords will block everyone who shares it.`);
       continue;
     }
+    if (min > parts.length) {
+      console.error(`  --min ${min} is more than the ${parts.length} words in "${name}".`);
+      continue;
+    }
     const items = parts.map((w) => {
       const { hash: h, len } = hash(w);
       return `{ hash: '${h}', len: ${len} }`;
     });
-    console.log(`    { words: [${items.join(', ')}], note: '' },`);
+    const minField = min >= 1 && min < parts.length ? `, min: ${min}` : '';
+    console.log(`    { words: [${items.join(', ')}]${minField}, note: '' },`);
   }
-  console.log('\nEvery word must appear for the entry to match, in any order, and');
-  console.log('separators are ignored - "First M.Last" and "FirstLast" match too.');
+  if (min >= 1) {
+    console.log(`\nAt least ${min} of the words must appear, in any order, with separators ignored.`);
+    console.log('Use this when a name part gets cut down to an initial: listing all three');
+    console.log('parts with --min 2 catches "A. Middle Last" and "Ada M. Last" alike, while');
+    console.log('anyone sharing only one part is untouched.');
+  } else {
+    console.log('\nEvery word must appear for the entry to match, in any order, and');
+    console.log('separators are ignored - "First M.Last" and "FirstLast" match too.');
+    console.log('If a part may be shortened to an initial, regenerate with --min 2.');
+  }
   console.log("Drop the trailing comma on the last entry and fill in `note`.");
   process.exit(0);
 }

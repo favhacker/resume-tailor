@@ -210,7 +210,12 @@
      that is not a letter stripped out first - so middle names, initials,
      reordering, odd separators and no separator at all are all caught:
        Ada Byron Lovelace / Ada B.Lovelace / Lovelace,Ada / AdaLovelace
-     while anyone sharing only one of the words is left alone. */
+     while anyone sharing only one of the words is left alone.
+
+     `min` relaxes "every word" to "at least this many", which is what answers
+     a name part being cut down to an initial: list all three parts with min 2
+     and "A. Byron Lovelace" and "Ada B. Lovelace" both still match, yet
+     somebody who shares a single part does not. */
 
   var HEX64 = /^[0-9a-f]{64}$/;
 
@@ -265,17 +270,29 @@
     return false;
   }
 
-  /* Every entry word must appear in the compacted name. Each is { hash, len },
-     or a plain word while editing (readable, but handy). */
-  function hitWords(subject, list, caseSensitive, idx) {
+  /* How many of the entry's words must appear. Defaults to all of them; `min`
+     lowers the bar, so ['first','middle','last'] with min 2 still catches a
+     name that has dropped one part down to an initial. */
+  function wordsNeeded(entry, total) {
+    var min = entry.min;
+    if (typeof min !== 'number' || min < 1) return total;
+    return min > total ? total : (min | 0);
+  }
+
+  /* Counts how many of the entry's words appear in the compacted name, and
+     compares that against `min`. Each word is { hash, len }, or a plain word
+     while editing (readable, but handy). */
+  function hitWords(subject, entry, caseSensitive, idx) {
+    var list = entry.words;
     if (!list.length) return false;
     var flat = compact(subject);
     if (!flat) return false;
 
     var tokens = null;   // built only for a legacy hash that carries no len
+    var found = 0, usable = 0;
 
     for (var i = 0; i < list.length; i++) {
-      var item = list[i], hash = '', len = -1, word = '';
+      var item = list[i], hash = '', len = -1, word = '', ok = false;
 
       if (item && typeof item === 'object') {
         hash = str(item.hash).toLowerCase();
@@ -289,27 +306,31 @@
 
       if (word) {
         var needle = compact(fold(word, caseSensitive));
-        if (needle && flat.indexOf(needle) === -1) return false;
+        if (!needle) continue;
+        usable++;
+        ok = flat.indexOf(needle) !== -1;
+      } else if (!hash) {
         continue;
+      } else if (len > 0) {
+        usable++;
+        ok = hasWindow(flat, hash, len);
+      } else {
+        /* No len recorded: all we can do is compare whole words, which is what
+           this used to do and what "Ada B.Lovelace" defeats. */
+        warnOnce('words-nolen-' + idx, 'access.config.js blocklist entry #' + (idx + 1) + ' has a words[] hash with no len, so it can only be matched as a whole word and will miss names written without separators. Regenerate it with: node hash-name.mjs --words "First Last"');
+        usable++;
+        if (tokens === null) {
+          tokens = [];
+          var ws = wordsOf(subject);
+          for (var j = 0; j < ws.length; j++) tokens.push(digest(ws[j]));
+        }
+        ok = tokens.indexOf(hash) !== -1;
       }
-      if (!hash) continue;
 
-      if (len > 0) {
-        if (!hasWindow(flat, hash, len)) return false;
-        continue;
-      }
-
-      /* No len recorded: all we can do is compare whole words, which is what
-         this used to do and what "Ada B.Lovelace" defeats. */
-      warnOnce('words-nolen-' + idx, 'access.config.js blocklist entry #' + (idx + 1) + ' has a words[] hash with no len, so it can only be matched as a whole word and will miss names written without separators. Regenerate it with: node hash-name.mjs --words "First Last"');
-      if (tokens === null) {
-        tokens = [];
-        var ws = wordsOf(subject);
-        for (var j = 0; j < ws.length; j++) tokens.push(digest(ws[j]));
-      }
-      if (tokens.indexOf(hash) === -1) return false;
+      if (ok) found++;
     }
-    return true;
+
+    return usable > 0 && found >= wordsNeeded(entry, usable);
   }
 
   function hitPlain(subject, needle, mode) {
@@ -357,7 +378,7 @@
       /* An entry carrying `words` is an allWords entry; order and anything
          between the words is irrelevant. */
       if (entry && typeof entry === 'object' && Array.isArray(entry.words)) {
-        if (hitWords(subject, entry.words, caseSensitive, i)) return true;
+        if (hitWords(subject, entry, caseSensitive, i)) return true;
         continue;
       }
 

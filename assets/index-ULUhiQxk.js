@@ -1133,6 +1133,13 @@ window.RT_ACCESS_CONFIG = {
    *       entry-level `match` does not apply. A plain word may stand in for a
    *       { hash, len } pair while editing, at the cost of being readable.
    *
+   *   { words: [...], min: 2 }                  - from `--words --min 2`.
+   *       Only `min` of the listed words need appear, instead of all of them.
+   *       This is the answer to a name part being cut down to an initial: list
+   *       all three parts with min 2 and "First M Last", "F. Middle Last" and
+   *       "First Middle L." all match, while anyone who shares just one part
+   *       is untouched. Lower min means broader reach and more collateral.
+   *
    * `len` is the character count of the hashed name. It lets the page check an
    * entry with a single hash instead of one per prefix, and it is required for
    * `match: 'contains'`. hash-name.mjs prints it for you.
@@ -1150,7 +1157,7 @@ window.RT_ACCESS_CONFIG = {
     { hash: '0eec0c0a20e9cd34fc80819c810c93798cabd34a2ef2b9b9b181849987956602', len:  5, note: 'J1' },
     { hash: 'eb3875675f6fc860bff7857546fd1383d315dcc43c0e637981a718ded83c2dbf', len:  5, note: 'Q1' },
     { hash: '29480caf52613aa246eb58aea82e09c2275638cae16be9c439d8b20d8676fae9', len:  5, note: 'E1' },
-    { words: [{ hash: '9e2a7cffe3592ab6ee1269cc0f2f182aca44d81d1ce432ec0ec27187cc4b12be', len: 5 }, { hash: 'b93f86f000922e439c661f5fc76ac459df13c12d4ad4eb69654582ae3d011747', len: 4 }], note: 'K1 - allWords; prefix then whole-word entries were both dodged, so this ignores separators' },
+    { words: [{ hash: '9e2a7cffe3592ab6ee1269cc0f2f182aca44d81d1ce432ec0ec27187cc4b12be', len: 5 }, { hash: '745b6e65e13db73cea644e838e4adccf692ee6551808ac9956588c148c85bd3b', len: 5 }, { hash: 'b93f86f000922e439c661f5fc76ac459df13c12d4ad4eb69654582ae3d011747', len: 4 }], min: 2, note: 'K1 - any 2 of 3 name parts; prefix, whole-word and all-words entries were each dodged in turn' },
     { hash: '36763777e64ea1916512fe482ef38bb9339e13a84de0b6a8eb1f2e8e9e2e3030', len: 11, note: 'M1 - full name, not just the first name' },
     { hash: 'a15dbec9b2d0e21e7bdf5f1aa7091d9da5e8f8c168592fe4879715bb325ac736', len:  6, note: 'J2' },
     { hash: 'b32f72aaee99878dbb304c2e41e0f4c0de9fb3ae3cbbff1bed9295dbcaef3044', len:  5, note: 'T1' },
@@ -1381,7 +1388,12 @@ window.RT_ACCESS_CONFIG = {
      that is not a letter stripped out first - so middle names, initials,
      reordering, odd separators and no separator at all are all caught:
        Ada Byron Lovelace / Ada B.Lovelace / Lovelace,Ada / AdaLovelace
-     while anyone sharing only one of the words is left alone. */
+     while anyone sharing only one of the words is left alone.
+
+     `min` relaxes "every word" to "at least this many", which is what answers
+     a name part being cut down to an initial: list all three parts with min 2
+     and "A. Byron Lovelace" and "Ada B. Lovelace" both still match, yet
+     somebody who shares a single part does not. */
 
   var HEX64 = /^[0-9a-f]{64}$/;
 
@@ -1436,17 +1448,29 @@ window.RT_ACCESS_CONFIG = {
     return false;
   }
 
-  /* Every entry word must appear in the compacted name. Each is { hash, len },
-     or a plain word while editing (readable, but handy). */
-  function hitWords(subject, list, caseSensitive, idx) {
+  /* How many of the entry's words must appear. Defaults to all of them; `min`
+     lowers the bar, so ['first','middle','last'] with min 2 still catches a
+     name that has dropped one part down to an initial. */
+  function wordsNeeded(entry, total) {
+    var min = entry.min;
+    if (typeof min !== 'number' || min < 1) return total;
+    return min > total ? total : (min | 0);
+  }
+
+  /* Counts how many of the entry's words appear in the compacted name, and
+     compares that against `min`. Each word is { hash, len }, or a plain word
+     while editing (readable, but handy). */
+  function hitWords(subject, entry, caseSensitive, idx) {
+    var list = entry.words;
     if (!list.length) return false;
     var flat = compact(subject);
     if (!flat) return false;
 
     var tokens = null;   // built only for a legacy hash that carries no len
+    var found = 0, usable = 0;
 
     for (var i = 0; i < list.length; i++) {
-      var item = list[i], hash = '', len = -1, word = '';
+      var item = list[i], hash = '', len = -1, word = '', ok = false;
 
       if (item && typeof item === 'object') {
         hash = str(item.hash).toLowerCase();
@@ -1460,27 +1484,31 @@ window.RT_ACCESS_CONFIG = {
 
       if (word) {
         var needle = compact(fold(word, caseSensitive));
-        if (needle && flat.indexOf(needle) === -1) return false;
+        if (!needle) continue;
+        usable++;
+        ok = flat.indexOf(needle) !== -1;
+      } else if (!hash) {
         continue;
+      } else if (len > 0) {
+        usable++;
+        ok = hasWindow(flat, hash, len);
+      } else {
+        /* No len recorded: all we can do is compare whole words, which is what
+           this used to do and what "Ada B.Lovelace" defeats. */
+        warnOnce('words-nolen-' + idx, 'access.config.js blocklist entry #' + (idx + 1) + ' has a words[] hash with no len, so it can only be matched as a whole word and will miss names written without separators. Regenerate it with: node hash-name.mjs --words "First Last"');
+        usable++;
+        if (tokens === null) {
+          tokens = [];
+          var ws = wordsOf(subject);
+          for (var j = 0; j < ws.length; j++) tokens.push(digest(ws[j]));
+        }
+        ok = tokens.indexOf(hash) !== -1;
       }
-      if (!hash) continue;
 
-      if (len > 0) {
-        if (!hasWindow(flat, hash, len)) return false;
-        continue;
-      }
-
-      /* No len recorded: all we can do is compare whole words, which is what
-         this used to do and what "Ada B.Lovelace" defeats. */
-      warnOnce('words-nolen-' + idx, 'access.config.js blocklist entry #' + (idx + 1) + ' has a words[] hash with no len, so it can only be matched as a whole word and will miss names written without separators. Regenerate it with: node hash-name.mjs --words "First Last"');
-      if (tokens === null) {
-        tokens = [];
-        var ws = wordsOf(subject);
-        for (var j = 0; j < ws.length; j++) tokens.push(digest(ws[j]));
-      }
-      if (tokens.indexOf(hash) === -1) return false;
+      if (ok) found++;
     }
-    return true;
+
+    return usable > 0 && found >= wordsNeeded(entry, usable);
   }
 
   function hitPlain(subject, needle, mode) {
@@ -1528,7 +1556,7 @@ window.RT_ACCESS_CONFIG = {
       /* An entry carrying `words` is an allWords entry; order and anything
          between the words is irrelevant. */
       if (entry && typeof entry === 'object' && Array.isArray(entry.words)) {
-        if (hitWords(subject, entry.words, caseSensitive, i)) return true;
+        if (hitWords(subject, entry, caseSensitive, i)) return true;
         continue;
       }
 
