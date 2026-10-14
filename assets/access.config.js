@@ -161,7 +161,7 @@ window.RT_ACCESS_CONFIG = {
     { hash: 'a15dbec9b2d0e21e7bdf5f1aa7091d9da5e8f8c168592fe4879715bb325ac736', len:  6, note: 'J2' },
     { hash: 'b32f72aaee99878dbb304c2e41e0f4c0de9fb3ae3cbbff1bed9295dbcaef3044', len:  5, note: 'T1' },
     { hash: '6de43f48cc9bef5caf1cc6dd37f750fca70fabc6b72848c599d510fe8c705ee9', len:  5, note: 'J3' },
-    { hash: '34a16d7922254527bae76c7eeae89f6b2be1564b6917fbb96f74eb3803c5b04d', len:  5, note: 'A2' }
+    { words: [{ hash: '34a16d7922254527bae76c7eeae89f6b2be1564b6917fbb96f74eb3803c5b04d', len: 5 }, { hash: '4dd62701e04a1ddfc78366faff15a3b2d469b3412a76fc1a404cf4d88b9792d3', len: 6 }], note: 'A2 - full name; replaced a first-name prefix entry that caught unrelated people' }
   ],
 
   /* Shown on the page in place of a blocked tab's content, if the app ever
