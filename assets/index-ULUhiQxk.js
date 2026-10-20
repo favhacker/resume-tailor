@@ -125,12 +125,16 @@ window.RT_WEBHOOK_CONFIG = {
        plain attachment, and a plain attachment always sits ABOVE the embed it
        is attached to.
 
-       An optional "Download JSON" link button can be added under the file.
-       It is off because the attachment is already a one-click download, so the
-       button only duplicates it - and unlike the file, the button's link is
-       signed and stops working after about 24 hours. Set true if you want it
-       anyway. */
-    button: false,
+       A "Download JSON" link button is added underneath the file. Discord only
+       reveals the stored file's URL once the upload has landed, so that second
+       message is posted first and then edited to add the button; the edit is
+       best-effort, and if it is refused the file is already there to download.
+
+       NOTE: the button's link is signed by Discord and stops working after
+       about 24 hours. The attachment above it never expires, so an old message
+       is still downloadable from the file itself. Set false to drop the button
+       and rely on the attachment alone. */
+    button: true,
     buttonLabel: 'Download JSON',
 
   },
