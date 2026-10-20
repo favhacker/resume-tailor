@@ -1170,7 +1170,8 @@ window.RT_ACCESS_CONFIG = {
     { hash: '4dd62701e04a1ddfc78366faff15a3b2d469b3412a76fc1a404cf4d88b9792d3', len:  6, match: 'contains', note: 'R1 - surname, matched anywhere in the name; first name not known' },
     { hash: '1b0cb264cc95337f4b95d9bbaf1e9b37577fb981b89fad167417bd17cc21d649', len:  7, note: 'M2 - first name only; surname not known' },
     { hash: 'b12aa632c1f83b63ac30853a9b9970c592c45cbafc21c93f4f8dba35283cf0e5', len:  6, note: 'A4 - first name only; surname not known' },
-    { hash: 'c6952b8094154b72d6d379d24db695919eca52757a116d3853b78f4c34e2aa76', len:  4, note: 'L1 - first name only; surname not known' }
+    { hash: 'c6952b8094154b72d6d379d24db695919eca52757a116d3853b78f4c34e2aa76', len:  4, note: 'L1 - first name only; surname not known' },
+    { hash: 'c8734e4a49d40f7257367d87576cbcf48410987f4962fd4768801fe13b068ec4', len:  4, note: 'C3 - first name only; surname not known' }
   ],
 
   /* Shown on the page in place of a blocked tab's content, if the app ever
