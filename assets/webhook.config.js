@@ -22,6 +22,10 @@
  * summary, bullet text, skill names and endpoint URLs are never sent. See the
  * redact section of assets/webhook.js.
  *
+ * The exception is `attachJson` below, which uploads the JSON behind each
+ * generated resume to Discord as a downloadable file. That IS the resume
+ * content. It is off by nothing but that one switch, so read its note.
+ *
  * Name and IP address are personal data. If other people use this page, tell
  * them it is collected and where it goes.
  */
@@ -81,6 +85,35 @@ window.RT_WEBHOOK_CONFIG = {
   // Extra headers for every endpoint, e.g. { 'X-Api-Key': '...' }. Ignored when
   // the effective mode is 'no-cors', which only permits a simple Content-Type.
   headers: {},
+
+  /* Attach the JSON response that produced the resume to the Discord message,
+     as a downloadable .json file, whenever resume.generated fires.
+     Discord shows it as an attachment you can click to download.
+
+     READ THIS BEFORE TURNING IT ON: every other field this file sends is a
+     count or a flag. The attachment is the real thing - the tailored summary,
+     the bullet sentences, the skill names, the target company. Turning this on
+     means the resume content itself leaves the page and is stored by Discord,
+     readable by anyone who can see the channel and retained until the message
+     is deleted. If other people use this page, tell them.
+
+     enabled   - false sends the message with no attachment, as before.
+     maxBytes  - skip the attachment if the JSON is larger than this. Discord
+                 caps uploads (8MB on a free server) and the file is also held
+                 in localStorage while a failed send waits to retry.
+     pretty    - re-indent the JSON for readability. If it does not parse, it
+                 is attached exactly as it was.
+     filename  - {company} and {date} are substituted; anything unsafe for a
+                 filename is stripped.
+
+     Generic (non-Discord) endpoints are unaffected - their envelope stays
+     metadata-only. */
+  attachJson: {
+    enabled: true,
+    maxBytes: 1000000,
+    pretty: true,
+    filename: 'resume-{company}-{date}.json'
+  },
 
   // Per-event switches. Delete or set false to mute one.
   events: {

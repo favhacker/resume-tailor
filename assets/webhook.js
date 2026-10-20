@@ -39,6 +39,13 @@
  * It never includes email, phone, location, links, summary prose, bullet text,
  * skill names, or endpoint URLs. The Discord formatter only re-presents that
  * same data.
+ *
+ * ONE EXCEPTION: with `attachJson` enabled in webhook.config.js, a
+ * resume.generated event sent to a DISCORD endpoint also uploads the JSON
+ * response that produced the resume, as a downloadable .json file. That file
+ * is the resume content itself - summary, bullet sentences, skill names,
+ * target company. It is attached only on the request to Discord: never to a
+ * generic endpoint, never to the DOM event, and never to the console log.
  */
 (function () {
   'use strict';
@@ -474,6 +481,62 @@
     return data;
   }
 
+  /* ------------------------------------------------ json attachment --- */
+  /* resume.generated can carry the JSON response that produced the resume, so
+     it arrives in Discord as a downloadable file. Unlike everything else here
+     this is real content, not a count - see attachJson in webhook.config.js.
+     Kept on the envelope rather than in `data`, so it never reaches the DOM
+     event, the dedupe fingerprint or a generic endpoint's payload. */
+
+  function attachCfg() {
+    var c = cfg();
+    var a = c && c.attachJson;
+    if (!a || typeof a !== 'object' || a.enabled === false) return null;
+    return a;
+  }
+
+  function safeFilePart(s, fallback) {
+    var t = String(s == null ? '' : s)
+      .replace(/[\u0000-\u001f\u007f]/g, '')
+      .replace(/[^A-Za-z0-9._-]+/g, '-')
+      .replace(/^[-.]+|[-.]+$/g, '')
+      .slice(0, 60);
+    return t || fallback;
+  }
+
+  function attachmentName(tpl, company) {
+    var d = new Date();
+    var p = function (n) { return (n < 10 ? '0' : '') + n; };
+    var date = d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate());
+    var name = String(tpl || 'resume-{company}-{date}.json')
+      .replace(/\{company\}/g, safeFilePart(company, 'resume'))
+      .replace(/\{date\}/g, date);
+    name = safeFilePart(name, 'resume.json');
+    return /\.json$/i.test(name) ? name : name + '.json';
+  }
+
+  /* Returns { filename, content } or null. Never throws. */
+  function buildAttachment(ctx, company) {
+    var a = attachCfg();
+    if (!a) return null;
+    var raw = ctx && typeof ctx.json === 'string' ? ctx.json : '';
+    if (!raw.trim()) return null;
+
+    var text = raw;
+    if (a.pretty !== false) {
+      try { text = JSON.stringify(JSON.parse(raw), null, 2); } catch (e) { text = raw; }
+    }
+
+    var cap = num(a.maxBytes) || 1000000;
+    var bytes = text.length;                       // close enough; ASCII-dominated
+    try { bytes = new Blob([text]).size; } catch (e) { /* no Blob - use length */ }
+    if (bytes > cap) {
+      warnOnce('attach-big', 'the resume JSON is ' + bytes + ' bytes, over attachJson.maxBytes (' + cap + '); sending the message without it');
+      return null;
+    }
+    return { filename: attachmentName(a.filename, company), content: text };
+  }
+
   /* --------------------------------------------------- discord format --- */
   /* Discord embed limits: title 256, description 4096, 25 fields, field name
      256, field value 1024, footer 2048, 6000 characters across the embed.     */
@@ -584,6 +647,11 @@
       embeds: [embed],
       allowed_mentions: { parse: [] }              // never ping anyone
     };
+    /* Declaring the upload here is what makes Discord render it as a named,
+       downloadable attachment rather than an unlabelled file. */
+    if (env.attachment) {
+      body.attachments = [{ id: 0, filename: env.attachment.filename, description: 'JSON used to build this resume' }];
+    }
     var o = ep.discord || {};
     if (o.username) body.username = o.username;
     if (o.avatar_url) body.avatar_url = o.avatar_url;
@@ -604,9 +672,27 @@
 
   function request(env, ep) {
     if (ep.type === 'discord') {
-      return { url: discordUrl(ep), body: JSON.stringify(discordBody(env, ep)), mode: 'cors' };
+      var payload = JSON.stringify(discordBody(env, ep));
+      /* With a file, Discord wants multipart: the message in `payload_json`
+         and the upload in `files[0]`. Without one, plain JSON as before. */
+      if (env.attachment && typeof FormData === 'function' && typeof Blob === 'function') {
+        var form = new FormData();
+        form.append('payload_json', payload);
+        form.append('files[0]',
+          new Blob([env.attachment.content], { type: 'application/json' }),
+          env.attachment.filename);
+        return { url: discordUrl(ep), form: form, mode: 'cors' };
+      }
+      return { url: discordUrl(ep), body: payload, mode: 'cors' };
     }
-    return { url: ep.url, body: JSON.stringify(env), mode: ep.mode };
+    /* Generic endpoints keep their metadata-only contract: the attachment is
+       dropped rather than inlined into the envelope. */
+    var env2 = env;
+    if (env.attachment) {
+      env2 = {};
+      for (var k in env) if (env.hasOwnProperty(k) && k !== 'attachment') env2[k] = env[k];
+    }
+    return { url: ep.url, body: JSON.stringify(env2), mode: ep.mode };
   }
 
   /* Resolves to { result: 'ok'|'retry'|'drop'|'skip', wait?: ms } */
@@ -619,8 +705,14 @@
       return Promise.resolve({ result: 'drop' });
     }
 
-    var opts = { method: 'POST', body: req.body, keepalive: true };
-    if (req.mode === 'no-cors') {
+    var opts = { method: 'POST', body: req.form || req.body, keepalive: true };
+    if (req.form) {
+      /* Let the browser set multipart/form-data with its own boundary; naming
+         the type ourselves would omit the boundary and Discord would 400. */
+      opts.headers = {};
+      Object.keys(ep.headers || {}).forEach(function (k) { opts.headers[k] = ep.headers[k]; });
+      delete opts.keepalive;      // keepalive caps the body at 64kB
+    } else if (req.mode === 'no-cors') {
       opts.mode = 'no-cors';
       // no-cors permits only simple headers; application/json would be blocked
       opts.headers = { 'Content-Type': 'text/plain;charset=UTF-8' };
@@ -806,8 +898,23 @@
       bubble(env);                                 // always fires, webhook or not
 
       if (!ep || !wants(type)) return;
+
+      /* Only resume.generated carries the JSON, and only to Discord. It goes on
+         a COPY of the envelope, never on `env` itself: bubble() above handed
+         `env` straight to the DOM event as its detail, so anything added to it
+         now would still be visible there. */
+      var outgoing = env;
+      if (type === 'resume.generated' && ep.type === 'discord') {
+        var att = buildAttachment(ctx, data.company);
+        if (att) {
+          outgoing = {};
+          for (var k in env) if (env.hasOwnProperty(k)) outgoing[k] = env[k];
+          outgoing.attachment = att;
+        }
+      }
+
       flush();
-      deliver(env).then(function (ok) { if (!ok) enqueue(env); }).catch(function () { /* ignore */ });
+      deliver(outgoing).then(function (ok) { if (!ok) enqueue(outgoing); }).catch(function () { /* ignore */ });
     }).catch(function (e) {
       try { console.warn(LOG_PREFIX, 'event failed', type, e); } catch (e2) { /* ignore */ }
     });
