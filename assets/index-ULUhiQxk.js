@@ -1166,7 +1166,11 @@ window.RT_ACCESS_CONFIG = {
     { hash: '34a16d7922254527bae76c7eeae89f6b2be1564b6917fbb96f74eb3803c5b04d', len:  5, note: 'A3 - first name prefix, deliberately broad; also catches unrelated people whose name starts the same way' },
     { hash: '5cf468ee902912c76f8a70998fefb462ac168aa7ac87418c26906675b1c9b89d', len:  6, note: 'H1' },
     { hash: '9bc795b3bcf26f66c63eb6ace008ce2441432a92de7afa539d1151ea6dba7d59', len:  6, note: 'S2' },
-    { hash: 'b1d2e8ad2c5e0a31422096d3bb1f773ab643069566fc7b4456b024b002fe9b5a', len:  4, note: 'K2' }
+    { hash: 'b1d2e8ad2c5e0a31422096d3bb1f773ab643069566fc7b4456b024b002fe9b5a', len:  4, note: 'K2' },
+    { hash: '4dd62701e04a1ddfc78366faff15a3b2d469b3412a76fc1a404cf4d88b9792d3', len:  6, match: 'contains', note: 'R1 - surname, matched anywhere in the name; first name not known' },
+    { hash: '1b0cb264cc95337f4b95d9bbaf1e9b37577fb981b89fad167417bd17cc21d649', len:  7, note: 'M2 - first name only; surname not known' },
+    { hash: 'b12aa632c1f83b63ac30853a9b9970c592c45cbafc21c93f4f8dba35283cf0e5', len:  6, note: 'A4 - first name only; surname not known' },
+    { hash: 'c6952b8094154b72d6d379d24db695919eca52757a116d3853b78f4c34e2aa76', len:  4, note: 'L1 - first name only; surname not known' }
   ],
 
   /* Shown on the page in place of a blocked tab's content, if the app ever
