@@ -112,7 +112,24 @@ window.RT_WEBHOOK_CONFIG = {
     enabled: true,
     maxBytes: 1000000,
     pretty: true,
-    filename: 'resume-{company}-{date}.json'
+    filename: 'resume-{company}-{date}.json',
+
+    /* Add a "Download JSON" link button under the message, so the file is one
+       click away instead of click-preview-then-download.
+
+       How it works: Discord only tells us the file's URL once the upload has
+       landed, so the message is posted first and then edited to add the button.
+       The edit is best-effort - if Discord refuses it the message is already
+       there, with the attachment, exactly as before.
+
+       KNOWN LIMIT: Discord signs attachment URLs and they expire, so the button
+       stops working after roughly 24 hours. The attachment itself never
+       expires - it stays downloadable from the message as usual. The button is
+       a shortcut while the message is fresh, not a permanent link.
+
+       Set false to post the message without it. */
+    button: true,
+    buttonLabel: 'Download JSON'
   },
 
   // Per-event switches. Delete or set false to mute one.

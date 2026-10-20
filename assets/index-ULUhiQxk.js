@@ -114,7 +114,24 @@ window.RT_WEBHOOK_CONFIG = {
     enabled: true,
     maxBytes: 1000000,
     pretty: true,
-    filename: 'resume-{company}-{date}.json'
+    filename: 'resume-{company}-{date}.json',
+
+    /* Add a "Download JSON" link button under the message, so the file is one
+       click away instead of click-preview-then-download.
+
+       How it works: Discord only tells us the file's URL once the upload has
+       landed, so the message is posted first and then edited to add the button.
+       The edit is best-effort - if Discord refuses it the message is already
+       there, with the attachment, exactly as before.
+
+       KNOWN LIMIT: Discord signs attachment URLs and they expire, so the button
+       stops working after roughly 24 hours. The attachment itself never
+       expires - it stays downloadable from the message as usual. The button is
+       a shortcut while the message is fresh, not a permanent link.
+
+       Set false to post the message without it. */
+    button: true,
+    buttonLabel: 'Download JSON'
   },
 
   // Per-event switches. Delete or set false to mute one.
@@ -815,12 +832,6 @@ window.RT_WEBHOOK_CONFIG = {
         lines.push('Unrecognised event.');
     }
 
-    /* The upload renders above the embed, so name it here - otherwise the file
-       and the message it belongs to read as two unrelated things.
-       The filename is already reduced to [A-Za-z0-9._-], so it is safe in a
-       code span without escaping (safeText would mangle the backticks). */
-    if (env.attachment) lines.push('\ud83d\udcce `' + env.attachment.filename + '`');
-
     // IP / country come from a third-party lookup, so they are escaped as untrusted text.
     var cl = d.client || {};
     var country = has(cl.country)
@@ -842,21 +853,22 @@ window.RT_WEBHOOK_CONFIG = {
     }
     while (size(embed) > 6000 && embed.fields.length) embed.fields.pop();
 
-    var body = {
-      embeds: [embed],
-      allowed_mentions: { parse: [] }              // never ping anyone
-    };
-    /* Declaring the upload here is what makes Discord render it as a named,
-       downloadable attachment rather than an unlabelled file. */
+    var body;
     if (env.attachment) {
-      body.attachments = [{ id: 0, filename: env.attachment.filename, description: 'JSON used to build this resume' }];
-      /* Discord puts attachments ABOVE embeds and previews a .json inline, so
-         without this the message opens on a wall of raw JSON with no idea what
-         it belongs to. `content` is the only part that renders above the file,
-         so it carries the headline. */
-      body.content = '📄 ' + (has(d.company)
-        ? '**' + safeText(d.company, 100) + '** — resume generated'
-        : 'Resume generated');
+      /* A classic attachment always renders ABOVE the embed - Discord decides
+         that, not us. Components V2 makes the file a positioned component
+         instead, so it can sit underneath the text where it belongs. */
+      body = {
+        flags: COMPONENTS_V2,
+        components: embedToComponents(embed, env.attachment.filename),
+        attachments: [{ id: 0, filename: env.attachment.filename, description: 'JSON used to build this resume' }],
+        allowed_mentions: { parse: [] }
+      };
+    } else {
+      body = {
+        embeds: [embed],
+        allowed_mentions: { parse: [] }            // never ping anyone
+      };
     }
     var o = ep.discord || {};
     if (o.username) body.username = o.username;
@@ -865,13 +877,128 @@ window.RT_WEBHOOK_CONFIG = {
     return body;
   }
 
-  function discordUrl(ep) {
+  /* ---------------------------------------------------- components v2 --- */
+  /* Renders the embed we already built as a Container, so the layout survives,
+     then puts the File after it. `content` and `embeds` are not permitted
+     alongside components v2, so everything moves inside the container. */
+
+  var COMPONENTS_V2 = 32768;                       // 1 << 15
+
+  function text(content) { return { type: 10, content: clip(content, 4000) }; }
+
+  function embedToComponents(embed, filename) {
+    var head = [];
+    if (embed.title) head.push('## ' + embed.title);
+    if (embed.author && embed.author.name) head.push(embed.author.name);
+    if (embed.description) head.push(embed.description);
+
+    var inner = [text(head.join(String.fromCharCode(10)))];
+
+    /* Two per line keeps the pairing readable without the wrapping a
+       three-column grid gets inside a container on a narrow window. */
+    var pairs = [], blocks = [], i;
+    for (i = 0; i < embed.fields.length; i++) {
+      var f = embed.fields[i];
+      (f.inline === false ? blocks : pairs).push('**' + f.name + '** ' + f.value);
+    }
+    var rows = [];
+    for (i = 0; i < pairs.length; i += 2) rows.push(pairs.slice(i, i + 2).join(' '));
+    rows = rows.concat(blocks);
+
+    if (rows.length) {
+      inner.push({ type: 14, divider: true, spacing: 1 });   // separator
+      inner.push(text(rows.join(String.fromCharCode(10))));
+    }
+    if (embed.footer && embed.footer.text) inner.push(text('-# ' + embed.footer.text));
+
+    return [
+      { type: 17, accent_color: embed.color, components: inner },   // container
+      { type: 13, file: { url: 'attachment://' + filename } }       // file, underneath
+    ];
+  }
+
+  function discordUrl(ep, withComponents) {
     try {
       var u = new URL(ep.url);
       u.searchParams.set('wait', 'true');          // report failures instead of silently dropping
+      // without this Discord ignores `components` on a plain incoming webhook
+      if (withComponents) u.searchParams.set('with_components', 'true');
       if (ep.discord && ep.discord.threadId) u.searchParams.set('thread_id', ep.discord.threadId);
       return u.toString();
     } catch (e) { return ep.url; }
+  }
+
+  /* ----------------------------------------------- download button --- */
+  /* The file's URL only exists once Discord has stored it, so the button
+     cannot ride along with the upload. We post the message, read the URL back
+     from the response, then edit the message to add a link button.
+
+     Link buttons are non-interactive, which is what lets a plain incoming
+     webhook send them - but only with `with_components=true`. If any of that
+     is refused, the message is already posted with its attachment and we just
+     log why. */
+
+  function messageUrl(ep, id) {
+    try {
+      var u = new URL(ep.url);
+      u.pathname = u.pathname.replace(/\/+$/, '') + '/messages/' + encodeURIComponent(id);
+      u.search = '';
+      u.searchParams.set('with_components', 'true');
+      if (ep.discord && ep.discord.threadId) u.searchParams.set('thread_id', ep.discord.threadId);
+      return u.toString();
+    } catch (e) { return null; }
+  }
+
+  function addDownloadButton(ep, msg, req) {
+    if (!msg || !msg.id) return Promise.resolve();
+
+    /* Where the stored file's URL lands depends on the format: a components v2
+       message carries it on the File component, a classic one on `attachments`. */
+    var fileComp = arr(msg.components).filter(function (c) { return c && c.type === 13; })[0];
+    var fileInfo = fileComp && fileComp.file;
+    var classic = arr(msg.attachments)[0];
+    var href = (fileInfo && fileInfo.url) || (classic && classic.url);
+    if (!href) return Promise.resolve();
+
+    var url = messageUrl(ep, msg.id);
+    if (!url) return Promise.resolve();
+
+    var row = {
+      type: 1,                                     // action row
+      components: [{
+        type: 2,                                   // button
+        style: 5,                                  // link - no interaction, so a webhook may send it
+        label: clip(String(req.buttonLabel || 'Download JSON'), 80),
+        url: href
+      }]
+    };
+
+    var body;
+    if (req.components) {
+      /* An edit replaces the whole message, so the components and the uploaded
+         file both have to be restated - otherwise adding the button would strip
+         them. Re-sends what we built, not Discord's echo of it. */
+      body = {
+        flags: COMPONENTS_V2,
+        components: req.components.concat([row]),
+        attachments: [{ id: (fileInfo && fileInfo.attachment_id) || (classic && classic.id), filename: req.filename }]
+      };
+    } else {
+      body = { components: [row] };
+    }
+
+    var headers = { 'Content-Type': 'application/json' };
+    Object.keys(ep.headers || {}).forEach(function (k) { headers[k] = ep.headers[k]; });
+
+    return fetch(url, { method: 'PATCH', headers: headers, body: JSON.stringify(body) })
+      .then(function (res) {
+        if (res.ok) { log(LOG_PREFIX, 'download button added'); return; }
+        return describe(res).then(function (why) {
+          warnOnce('button-' + ep.id + '-' + res.status,
+            'could not add the download button (HTTP ' + res.status + '); the message and its attachment were sent normally', why);
+        });
+      })
+      .catch(function () { /* network blip - the message is already posted */ });
   }
 
   /* -------------------------------------------------------- transport --- */
@@ -887,7 +1014,18 @@ window.RT_WEBHOOK_CONFIG = {
         form.append('files[0]',
           new Blob([env.attachment.content], { type: 'application/json' }),
           env.attachment.filename);
-        return { url: discordUrl(ep), form: form, mode: 'cors' };
+        var a = attachCfg();
+        var sent = JSON.parse(payload);
+        return {
+          url: discordUrl(ep, true),
+          form: form,
+          mode: 'cors',
+          button: !!(a && a.button !== false),
+          buttonLabel: a && a.buttonLabel,
+          // kept so the button edit can restate the message unchanged
+          components: sent.components || null,
+          filename: env.attachment.filename
+        };
       }
       return { url: discordUrl(ep), body: payload, mode: 'cors' };
     }
@@ -930,7 +1068,18 @@ window.RT_WEBHOOK_CONFIG = {
     try {
       return fetch(req.url, opts).then(function (res) {
         if (opts.mode === 'no-cors') return { result: 'ok' };   // opaque response, assume sent
-        if (res.ok) return { result: 'ok' };
+        if (res.ok) {
+          /* Delivered. If a button was asked for, read the stored file's URL
+             out of the response and edit it in. Never changes the result:
+             the message is already posted either way. */
+          if (req.button) {
+            return res.json()
+              .then(function (msg) { return addDownloadButton(ep, msg, req); })
+              .then(function () { return { result: 'ok' }; })
+              .catch(function () { return { result: 'ok' }; });
+          }
+          return { result: 'ok' };
+        }
         if (res.status === 429) return retryAfter(res).then(function (ms) { return { result: 'retry', wait: ms }; });
         // other client errors (bad token, deleted webhook, malformed body) will not fix themselves
         if (res.status >= 400 && res.status < 500 && res.status !== 408) {
