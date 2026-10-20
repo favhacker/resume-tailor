@@ -573,6 +573,18 @@
     var v = String(value == null || value === '' ? 'n/a' : value);
     return { name: clip(name, 256), value: clip(v, 1024), inline: inline !== false };
   }
+  /* Same, but nothing is rendered for an empty or zero value. Keeps rows like
+     "Certifications 0" and "Bold keywords 0" out of the message instead of
+     padding it with absences. */
+  function fieldIf(name, value, inline) {
+    if (value == null || value === '' || value === 0 || value === '0') return null;
+    return field(name, value, inline);
+  }
+  function kept(list) {
+    var out = [];
+    for (var i = 0; i < list.length; i++) if (list[i]) out.push(list[i]);
+    return out;
+  }
 
   function profileFields(p) {
     if (!p) return [field('Profile', 'unavailable', false)];
@@ -591,23 +603,34 @@
     var d = env.data || {};
     var meta = DC[env.type] || { title: clip(String(env.type), 200), color: 0x99AAB5 };
     var embed = { title: meta.title, color: meta.color, fields: [] };
-    var lines = ['Profile: ' + (has(d.profileName) ? '**' + safeText(d.profileName, 100) + '**' : '_not set_')];
+    var lines = [];
+
+    /* Whose profile it was goes in the author slot rather than a description
+       line - it reads as a heading and leaves the description for detail. */
+    if (has(d.profileName)) embed.author = { name: safeText(d.profileName, 100) };
+    else lines.push('_Profile name not set_');
 
     switch (env.type) {
       case 'resume.generated': {
-        lines.push('Target company: ' + (has(d.company) ? '**' + safeText(d.company, 200) + '**' : '_not specified_'));
+        /* The company is the one thing worth scanning for, so it becomes the
+           headline; the event name moves down to the footer. */
+        if (has(d.company)) embed.title = safeText(d.company, 200);
+        else lines.push('_Target company not specified_');
+
         var r = d.resume || {}, s = d.settings || {};
-        embed.fields.push(
+        embed.fields = kept([
           field('Source', SOURCES[d.source] || d.source),
-          field('Experience entries', r.experienceCount),
+          field('Experience', r.experienceCount),
           field('Bullet points', r.bulletCount),
-          field('Skills', r.skillCount != null ? r.skillCount + ' in ' + r.skillCategoryCount + ' categories' : null),
-          field('Bold keywords', r.boldSpans),
-          field('Summary', r.hasSummary ? 'Yes (' + r.summaryLength + ' chars)' : 'No'),
-          field('Education', r.educationCount),
-          field('Certifications', r.certificationCount),
-          field('Layout', s.fontFamily ? s.fontFamily + ' ' + (s.fontSize || '?') + 'pt, ' + (s.experienceLayout || 'default') : null)
-        );
+          fieldIf('Skills', r.skillCount != null ? r.skillCount + ' in ' + r.skillCategoryCount + ' categories' : null),
+          fieldIf('Summary', r.hasSummary ? r.summaryLength + ' chars' : null),
+          fieldIf('Education', r.educationCount),
+          fieldIf('Certifications', r.certificationCount),
+          fieldIf('Bold keywords', r.boldSpans),
+          fieldIf('Layout', s.fontFamily
+            ? s.fontFamily + ' ' + (s.fontSize || '?') + 'pt · ' + (s.experienceLayout || 'default')
+            : null, false)
+        ]);
         break;
       }
       case 'profile.updated':
@@ -623,22 +646,29 @@
         lines.push('Unrecognised event.');
     }
 
+    /* The upload renders above the embed, so name it here - otherwise the file
+       and the message it belongs to read as two unrelated things.
+       The filename is already reduced to [A-Za-z0-9._-], so it is safe in a
+       code span without escaping (safeText would mangle the backticks). */
+    if (env.attachment) lines.push('\ud83d\udcce `' + env.attachment.filename + '`');
+
     // IP / country come from a third-party lookup, so they are escaped as untrusted text.
-    // Shown in the description (not a field) so they are clearly visible up top.
     var cl = d.client || {};
     var country = has(cl.country)
       ? safeText(cl.country, 100) + (has(cl.countryCode) ? ' (' + safeText(cl.countryCode, 2) + ')' : '')
       : (has(cl.countryCode) ? safeText(cl.countryCode, 2) : 'unknown');
-    lines.push('IP address: ' + (has(cl.ip) ? '**' + safeText(cl.ip, 45) + '**' : '_unknown_') + ' - ' + country);
+    lines.push('\ud83c\udf10 ' + (has(cl.ip) ? '`' + safeText(cl.ip, 45) + '`' : '_unknown_') + ' \u00b7 ' + country);
 
     embed.description = clip(lines.join(String.fromCharCode(10)), 4096);
     embed.fields = embed.fields.slice(0, 25);
-    embed.footer = { text: clip(env.source + ' \u2022 session ' + String(env.sessionId).slice(0, 8), 2048) };
+    /* The event name lives here now that the title carries the company. */
+    embed.footer = { text: clip(meta.title + ' \u2022 ' + env.source + ' \u2022 session ' + String(env.sessionId).slice(0, 8), 2048) };
     if (env.occurredAt) embed.timestamp = env.occurredAt;
 
     // stay inside the 6000-character total by shedding fields from the end
     function size(e) {
       return (e.title || '').length + (e.description || '').length + e.footer.text.length +
+        ((e.author && e.author.name) || '').length +
         e.fields.reduce(function (n, f) { return n + f.name.length + f.value.length; }, 0);
     }
     while (size(embed) > 6000 && embed.fields.length) embed.fields.pop();
@@ -651,6 +681,13 @@
        downloadable attachment rather than an unlabelled file. */
     if (env.attachment) {
       body.attachments = [{ id: 0, filename: env.attachment.filename, description: 'JSON used to build this resume' }];
+      /* Discord puts attachments ABOVE embeds and previews a .json inline, so
+         without this the message opens on a wall of raw JSON with no idea what
+         it belongs to. `content` is the only part that renders above the file,
+         so it carries the headline. */
+      body.content = '📄 ' + (has(d.company)
+        ? '**' + safeText(d.company, 100) + '** — resume generated'
+        : 'Resume generated');
     }
     var o = ep.discord || {};
     if (o.username) body.username = o.username;
