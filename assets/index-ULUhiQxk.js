@@ -131,7 +131,27 @@ window.RT_WEBHOOK_CONFIG = {
 
        Set false to post the message without it. */
     button: true,
-    buttonLabel: 'Download JSON'
+    buttonLabel: 'Download JSON',
+
+    /* Show the start of the JSON as a syntax-highlighted code block under the
+       message, in place of Discord's file card.
+
+       enabled  - false leaves the message with no preview.
+       maxLines - how many lines to show before truncating.
+       maxChars - hard cap; a components-v2 message allows 4000 characters of
+                  text in total, shared with everything above.
+
+       WHAT THIS COSTS: with `fileCard` off the preview replaces Discord's
+       permanent file entry, so the button becomes the only way to get the whole
+       file - and that link expires after about 24 hours. After that the preview
+       text is all that is left in the channel. Set fileCard: true to keep the
+       file entry as well, which never expires. */
+    preview: {
+      enabled: true,
+      maxLines: 14,
+      maxChars: 1200
+    },
+    fileCard: false
   },
 
   // Per-event switches. Delete or set false to mute one.
@@ -791,17 +811,17 @@ window.RT_WEBHOOK_CONFIG = {
     var embed = { title: meta.title, color: meta.color, fields: [] };
     var lines = [];
 
-    /* Whose profile it was goes in the author slot rather than a description
-       line - it reads as a heading and leaves the description for detail. */
-    if (has(d.profileName)) embed.author = { name: safeText(d.profileName, 100) };
-    else lines.push('_Profile name not set_');
+    /* Reading order is what happened, then who it happened to, then the
+       details. The event name is the heading (embed.title, rendered as `##` in
+       the components build) and the profile name sits right under it as a
+       sub-heading; everything else stays at body weight. */
+    lines.push('### ' + (has(d.profileName) ? safeText(d.profileName, 100) : 'Unknown profile'));
 
     switch (env.type) {
       case 'resume.generated': {
-        /* The company is the one thing worth scanning for, so it becomes the
-           headline; the event name moves down to the footer. */
-        if (has(d.company)) embed.title = safeText(d.company, 200);
-        else lines.push('_Target company not specified_');
+        lines.push(has(d.company)
+          ? 'for **' + safeText(d.company, 200) + '**'
+          : '_Target company not specified_');
 
         var r = d.resume || {}, s = d.settings || {};
         embed.fields = kept([
@@ -841,8 +861,7 @@ window.RT_WEBHOOK_CONFIG = {
 
     embed.description = clip(lines.join(String.fromCharCode(10)), 4096);
     embed.fields = embed.fields.slice(0, 25);
-    /* The event name lives here now that the title carries the company. */
-    embed.footer = { text: clip(meta.title + ' \u2022 ' + env.source + ' \u2022 session ' + String(env.sessionId).slice(0, 8), 2048) };
+    embed.footer = { text: clip(env.source + ' \u2022 session ' + String(env.sessionId).slice(0, 8), 2048) };
     if (env.occurredAt) embed.timestamp = env.occurredAt;
 
     // stay inside the 6000-character total by shedding fields from the end
@@ -858,9 +877,18 @@ window.RT_WEBHOOK_CONFIG = {
       /* A classic attachment always renders ABOVE the embed - Discord decides
          that, not us. Components V2 makes the file a positioned component
          instead, so it can sit underneath the text where it belongs. */
+      /* The File component is what carries the upload, so it is always present
+         on the way out. If the file card is not wanted in the final message,
+         the button edit drops it afterwards - the stored file stays reachable
+         by URL either way. */
+      var parts = [embedToComponents(embed, env.attachment.filename)];
+      var pv = previewBlock(env.attachment.content);
+      if (pv) parts.push(pv);
+      parts.push(fileComponent(env.attachment.filename));
+
       body = {
         flags: COMPONENTS_V2,
-        components: embedToComponents(embed, env.attachment.filename),
+        components: parts,
         attachments: [{ id: 0, filename: env.attachment.filename, description: 'JSON used to build this resume' }],
         allowed_mentions: { parse: [] }
       };
@@ -886,10 +914,35 @@ window.RT_WEBHOOK_CONFIG = {
 
   function text(content) { return { type: 10, content: clip(content, 4000) }; }
 
+  /* The first few lines of the JSON as a fenced code block, so the message
+     shows what was generated without anyone having to download it. Returns
+     null when switched off. */
+  function previewBlock(json) {
+    var a = attachCfg();
+    var p = a && a.preview;
+    if (!p || typeof p !== 'object' || p.enabled === false) return null;
+    if (typeof json !== 'string' || !json.trim()) return null;
+
+    var maxLines = num(p.maxLines) || 14;
+    var maxChars = num(p.maxChars) || 1200;
+
+    var lines = json.replace(/\r\n?/g, String.fromCharCode(10)).split(String.fromCharCode(10));
+    var cut = lines.length > maxLines;
+    var body = lines.slice(0, maxLines).join(String.fromCharCode(10));
+    if (body.length > maxChars) { body = body.slice(0, maxChars); cut = true; }
+
+    /* A fence inside the content would end the block early and let the rest
+       render as markdown, so neutralise any backtick run. */
+    body = body.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '')
+      .replace(/`{3,}/g, '‘‘‘');
+
+    return text('```json' + String.fromCharCode(10) + body +
+      (cut ? String.fromCharCode(10) + '…' : '') + String.fromCharCode(10) + '```');
+  }
+
   function embedToComponents(embed, filename) {
     var head = [];
-    if (embed.title) head.push('## ' + embed.title);
-    if (embed.author && embed.author.name) head.push(embed.author.name);
+    if (embed.title) head.push('## ' + embed.title);   // the event name
     if (embed.description) head.push(embed.description);
 
     var inner = [text(head.join(String.fromCharCode(10)))];
@@ -911,10 +964,11 @@ window.RT_WEBHOOK_CONFIG = {
     }
     if (embed.footer && embed.footer.text) inner.push(text('-# ' + embed.footer.text));
 
-    return [
-      { type: 17, accent_color: embed.color, components: inner },   // container
-      { type: 13, file: { url: 'attachment://' + filename } }       // file, underneath
-    ];
+    return { type: 17, accent_color: embed.color, components: inner };
+  }
+
+  function fileComponent(filename) {
+    return { type: 13, file: { url: 'attachment://' + filename } };
   }
 
   function discordUrl(ep, withComponents) {
@@ -980,9 +1034,14 @@ window.RT_WEBHOOK_CONFIG = {
          them. Re-sends what we built, not Discord's echo of it. */
       body = {
         flags: COMPONENTS_V2,
-        components: req.components.concat([row]),
-        attachments: [{ id: (fileInfo && fileInfo.attachment_id) || (classic && classic.id), filename: req.filename }]
+        components: req.components.concat([row])
       };
+      /* Only restate the upload when the card is staying; without a File
+         component to hold it Discord drops the entry, and the file remains
+         reachable through the button's URL. */
+      if (req.keepCard) {
+        body.attachments = [{ id: (fileInfo && fileInfo.attachment_id) || (classic && classic.id), filename: req.filename }];
+      }
     } else {
       body = { components: [row] };
     }
@@ -1016,14 +1075,21 @@ window.RT_WEBHOOK_CONFIG = {
           env.attachment.filename);
         var a = attachCfg();
         var sent = JSON.parse(payload);
+        var keepCard = !!(a && a.fileCard);
+        /* What the message should look like once the button is added. The File
+           component is dropped here unless the card is wanted, which is what
+           replaces Discord's file entry with the preview. */
+        var finalParts = (sent.components || []).filter(function (c) {
+          return keepCard || !c || c.type !== 13;
+        });
         return {
           url: discordUrl(ep, true),
           form: form,
           mode: 'cors',
           button: !!(a && a.button !== false),
           buttonLabel: a && a.buttonLabel,
-          // kept so the button edit can restate the message unchanged
-          components: sent.components || null,
+          components: finalParts,
+          keepCard: keepCard,
           filename: env.attachment.filename
         };
       }

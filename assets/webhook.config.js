@@ -129,7 +129,27 @@ window.RT_WEBHOOK_CONFIG = {
 
        Set false to post the message without it. */
     button: true,
-    buttonLabel: 'Download JSON'
+    buttonLabel: 'Download JSON',
+
+    /* Show the start of the JSON as a syntax-highlighted code block under the
+       message, in place of Discord's file card.
+
+       enabled  - false leaves the message with no preview.
+       maxLines - how many lines to show before truncating.
+       maxChars - hard cap; a components-v2 message allows 4000 characters of
+                  text in total, shared with everything above.
+
+       WHAT THIS COSTS: with `fileCard` off the preview replaces Discord's
+       permanent file entry, so the button becomes the only way to get the whole
+       file - and that link expires after about 24 hours. After that the preview
+       text is all that is left in the channel. Set fileCard: true to keep the
+       file entry as well, which never expires. */
+    preview: {
+      enabled: true,
+      maxLines: 14,
+      maxChars: 1200
+    },
+    fileCard: false
   },
 
   // Per-event switches. Delete or set false to mute one.
