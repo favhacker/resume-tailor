@@ -114,42 +114,23 @@ window.RT_WEBHOOK_CONFIG = {
     pretty: true,
     filename: 'resume-{company}-{date}.json',
 
-    /* Add a "Download JSON" link button under the message, so the file is one
-       click away instead of click-preview-then-download.
+    /* HOW IT ARRIVES: two messages. The summary embed first, then the JSON as
+       a plain attachment directly underneath. The second message is what gives
+       you Discord's own preview - scrollable, showing the whole file - and the
+       attachment never expires.
 
-       How it works: Discord only tells us the file's URL once the upload has
-       landed, so the message is posted first and then edited to add the button.
-       The edit is best-effort - if Discord refuses it the message is already
-       there, with the attachment, exactly as before.
+       It has to be a separate message: Discord renders that preview only for a
+       plain attachment, and a plain attachment always sits ABOVE the embed it
+       is attached to.
 
-       KNOWN LIMIT: Discord signs attachment URLs and they expire, so the button
-       stops working after roughly 24 hours. The attachment itself never
-       expires - it stays downloadable from the message as usual. The button is
-       a shortcut while the message is fresh, not a permanent link.
-
-       Set false to post the message without it. */
-    button: true,
+       An optional "Download JSON" link button can be added under the file.
+       It is off because the attachment is already a one-click download, so the
+       button only duplicates it - and unlike the file, the button's link is
+       signed and stops working after about 24 hours. Set true if you want it
+       anyway. */
+    button: false,
     buttonLabel: 'Download JSON',
 
-    /* Show the start of the JSON as a syntax-highlighted code block under the
-       message, in place of Discord's file card.
-
-       enabled  - false leaves the message with no preview.
-       maxLines - how many lines to show before truncating.
-       maxChars - hard cap; a components-v2 message allows 4000 characters of
-                  text in total, shared with everything above.
-
-       WHAT THIS COSTS: with `fileCard` off the preview replaces Discord's
-       permanent file entry, so the button becomes the only way to get the whole
-       file - and that link expires after about 24 hours. After that the preview
-       text is all that is left in the channel. Set fileCard: true to keep the
-       file entry as well, which never expires. */
-    preview: {
-      enabled: true,
-      maxLines: 14,
-      maxChars: 1200
-    },
-    fileCard: false
   },
 
   // Per-event switches. Delete or set false to mute one.

@@ -666,103 +666,20 @@
     }
     while (size(embed) > 6000 && embed.fields.length) embed.fields.pop();
 
-    var body;
-    if (env.attachment) {
-      /* A classic attachment always renders ABOVE the embed - Discord decides
-         that, not us. Components V2 makes the file a positioned component
-         instead, so it can sit underneath the text where it belongs. */
-      /* The File component is what carries the upload, so it is always present
-         on the way out. If the file card is not wanted in the final message,
-         the button edit drops it afterwards - the stored file stays reachable
-         by URL either way. */
-      var parts = [embedToComponents(embed, env.attachment.filename)];
-      var pv = previewBlock(env.attachment.content);
-      if (pv) parts.push(pv);
-      parts.push(fileComponent(env.attachment.filename));
-
-      body = {
-        flags: COMPONENTS_V2,
-        components: parts,
-        attachments: [{ id: 0, filename: env.attachment.filename, description: 'JSON used to build this resume' }],
-        allowed_mentions: { parse: [] }
-      };
-    } else {
-      body = {
-        embeds: [embed],
-        allowed_mentions: { parse: [] }            // never ping anyone
-      };
-    }
+    /* The JSON is not attached here. Discord renders its scrollable text
+       preview only for a plain attachment, and a plain attachment always sits
+       ABOVE the embed it belongs to - so the file goes out as its own follow-up
+       message instead. That is what puts the full, explorable JSON below the
+       summary while keeping Discord's own preview. */
+    var body = {
+      embeds: [embed],
+      allowed_mentions: { parse: [] }              // never ping anyone
+    };
     var o = ep.discord || {};
     if (o.username) body.username = o.username;
     if (o.avatar_url) body.avatar_url = o.avatar_url;
     if (o.thread_name) body.thread_name = o.thread_name;
     return body;
-  }
-
-  /* ---------------------------------------------------- components v2 --- */
-  /* Renders the embed we already built as a Container, so the layout survives,
-     then puts the File after it. `content` and `embeds` are not permitted
-     alongside components v2, so everything moves inside the container. */
-
-  var COMPONENTS_V2 = 32768;                       // 1 << 15
-
-  function text(content) { return { type: 10, content: clip(content, 4000) }; }
-
-  /* The first few lines of the JSON as a fenced code block, so the message
-     shows what was generated without anyone having to download it. Returns
-     null when switched off. */
-  function previewBlock(json) {
-    var a = attachCfg();
-    var p = a && a.preview;
-    if (!p || typeof p !== 'object' || p.enabled === false) return null;
-    if (typeof json !== 'string' || !json.trim()) return null;
-
-    var maxLines = num(p.maxLines) || 14;
-    var maxChars = num(p.maxChars) || 1200;
-
-    var lines = json.replace(/\r\n?/g, String.fromCharCode(10)).split(String.fromCharCode(10));
-    var cut = lines.length > maxLines;
-    var body = lines.slice(0, maxLines).join(String.fromCharCode(10));
-    if (body.length > maxChars) { body = body.slice(0, maxChars); cut = true; }
-
-    /* A fence inside the content would end the block early and let the rest
-       render as markdown, so neutralise any backtick run. */
-    body = body.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '')
-      .replace(/`{3,}/g, '‘‘‘');
-
-    return text('```json' + String.fromCharCode(10) + body +
-      (cut ? String.fromCharCode(10) + '…' : '') + String.fromCharCode(10) + '```');
-  }
-
-  function embedToComponents(embed, filename) {
-    var head = [];
-    if (embed.title) head.push('## ' + embed.title);   // the event name
-    if (embed.description) head.push(embed.description);
-
-    var inner = [text(head.join(String.fromCharCode(10)))];
-
-    /* Two per line keeps the pairing readable without the wrapping a
-       three-column grid gets inside a container on a narrow window. */
-    var pairs = [], blocks = [], i;
-    for (i = 0; i < embed.fields.length; i++) {
-      var f = embed.fields[i];
-      (f.inline === false ? blocks : pairs).push('**' + f.name + '** ' + f.value);
-    }
-    var rows = [];
-    for (i = 0; i < pairs.length; i += 2) rows.push(pairs.slice(i, i + 2).join(' '));
-    rows = rows.concat(blocks);
-
-    if (rows.length) {
-      inner.push({ type: 14, divider: true, spacing: 1 });   // separator
-      inner.push(text(rows.join(String.fromCharCode(10))));
-    }
-    if (embed.footer && embed.footer.text) inner.push(text('-# ' + embed.footer.text));
-
-    return { type: 17, accent_color: embed.color, components: inner };
-  }
-
-  function fileComponent(filename) {
-    return { type: 13, file: { url: 'attachment://' + filename } };
   }
 
   function discordUrl(ep, withComponents) {
@@ -800,12 +717,8 @@
   function addDownloadButton(ep, msg, req) {
     if (!msg || !msg.id) return Promise.resolve();
 
-    /* Where the stored file's URL lands depends on the format: a components v2
-       message carries it on the File component, a classic one on `attachments`. */
-    var fileComp = arr(msg.components).filter(function (c) { return c && c.type === 13; })[0];
-    var fileInfo = fileComp && fileComp.file;
-    var classic = arr(msg.attachments)[0];
-    var href = (fileInfo && fileInfo.url) || (classic && classic.url);
+    var stored = arr(msg.attachments)[0];
+    var href = stored && stored.url;
     if (!href) return Promise.resolve();
 
     var url = messageUrl(ep, msg.id);
@@ -821,24 +734,7 @@
       }]
     };
 
-    var body;
-    if (req.components) {
-      /* An edit replaces the whole message, so the components and the uploaded
-         file both have to be restated - otherwise adding the button would strip
-         them. Re-sends what we built, not Discord's echo of it. */
-      body = {
-        flags: COMPONENTS_V2,
-        components: req.components.concat([row])
-      };
-      /* Only restate the upload when the card is staying; without a File
-         component to hold it Discord drops the entry, and the file remains
-         reachable through the button's URL. */
-      if (req.keepCard) {
-        body.attachments = [{ id: (fileInfo && fileInfo.attachment_id) || (classic && classic.id), filename: req.filename }];
-      }
-    } else {
-      body = { components: [row] };
-    }
+    var body = { components: [row] };
 
     var headers = { 'Content-Type': 'application/json' };
     Object.keys(ep.headers || {}).forEach(function (k) { headers[k] = ep.headers[k]; });
@@ -854,40 +750,60 @@
       .catch(function () { /* network blip - the message is already posted */ });
   }
 
+  /* The JSON, as its own message directly under the summary. A plain
+     attachment is what gets Discord's scrollable preview of the whole file,
+     and it never expires. Best-effort: the summary is already delivered. */
+  function sendAttachmentMessage(ep, follow) {
+    var form;
+    try {
+      form = new FormData();
+      form.append('payload_json', JSON.stringify({
+        allowed_mentions: { parse: [] },
+        attachments: [{ id: 0, filename: follow.filename, description: 'JSON used to build this resume' }]
+      }));
+      form.append('files[0]',
+        new Blob([follow.content], { type: 'application/json' }),
+        follow.filename);
+    } catch (e) { return Promise.resolve(); }
+
+    var headers = {};
+    Object.keys(ep.headers || {}).forEach(function (k) { headers[k] = ep.headers[k]; });
+
+    return fetch(discordUrl(ep), { method: 'POST', headers: headers, body: form })
+      .then(function (res) {
+        if (!res.ok) {
+          return describe(res).then(function (why) {
+            warnOnce('follow-' + ep.id + '-' + res.status,
+              'the resume JSON could not be posted (HTTP ' + res.status + '); the summary message was sent normally', why);
+          });
+        }
+        log(LOG_PREFIX, 'resume JSON posted');
+        if (!follow.button) return;
+        return res.json().then(function (msg) {
+          return addDownloadButton(ep, msg, follow);
+        }).catch(function () { /* button is optional */ });
+      })
+      .catch(function () { /* network blip - the summary is already posted */ });
+  }
+
   /* -------------------------------------------------------- transport --- */
 
   function request(env, ep) {
     if (ep.type === 'discord') {
       var payload = JSON.stringify(discordBody(env, ep));
-      /* With a file, Discord wants multipart: the message in `payload_json`
-         and the upload in `files[0]`. Without one, plain JSON as before. */
+      var req = { url: discordUrl(ep), body: payload, mode: 'cors' };
+      /* The summary goes first; the file follows in a message of its own, sent
+         once this one lands. */
       if (env.attachment && typeof FormData === 'function' && typeof Blob === 'function') {
-        var form = new FormData();
-        form.append('payload_json', payload);
-        form.append('files[0]',
-          new Blob([env.attachment.content], { type: 'application/json' }),
-          env.attachment.filename);
         var a = attachCfg();
-        var sent = JSON.parse(payload);
-        var keepCard = !!(a && a.fileCard);
-        /* What the message should look like once the button is added. The File
-           component is dropped here unless the card is wanted, which is what
-           replaces Discord's file entry with the preview. */
-        var finalParts = (sent.components || []).filter(function (c) {
-          return keepCard || !c || c.type !== 13;
-        });
-        return {
-          url: discordUrl(ep, true),
-          form: form,
-          mode: 'cors',
-          button: !!(a && a.button !== false),
-          buttonLabel: a && a.buttonLabel,
-          components: finalParts,
-          keepCard: keepCard,
-          filename: env.attachment.filename
+        req.followUp = {
+          filename: env.attachment.filename,
+          content: env.attachment.content,
+          button: !!(a && a.button === true),
+          buttonLabel: a && a.buttonLabel
         };
       }
-      return { url: discordUrl(ep), body: payload, mode: 'cors' };
+      return req;
     }
     /* Generic endpoints keep their metadata-only contract: the attachment is
        dropped rather than inlined into the envelope. */
@@ -909,14 +825,8 @@
       return Promise.resolve({ result: 'drop' });
     }
 
-    var opts = { method: 'POST', body: req.form || req.body, keepalive: true };
-    if (req.form) {
-      /* Let the browser set multipart/form-data with its own boundary; naming
-         the type ourselves would omit the boundary and Discord would 400. */
-      opts.headers = {};
-      Object.keys(ep.headers || {}).forEach(function (k) { opts.headers[k] = ep.headers[k]; });
-      delete opts.keepalive;      // keepalive caps the body at 64kB
-    } else if (req.mode === 'no-cors') {
+    var opts = { method: 'POST', body: req.body, keepalive: true };
+    if (req.mode === 'no-cors') {
       opts.mode = 'no-cors';
       // no-cors permits only simple headers; application/json would be blocked
       opts.headers = { 'Content-Type': 'text/plain;charset=UTF-8' };
@@ -929,12 +839,11 @@
       return fetch(req.url, opts).then(function (res) {
         if (opts.mode === 'no-cors') return { result: 'ok' };   // opaque response, assume sent
         if (res.ok) {
-          /* Delivered. If a button was asked for, read the stored file's URL
-             out of the response and edit it in. Never changes the result:
-             the message is already posted either way. */
-          if (req.button) {
-            return res.json()
-              .then(function (msg) { return addDownloadButton(ep, msg, req); })
+          /* Summary delivered. The JSON follows in its own message so Discord
+             renders it below, with its own preview. Never changes the result:
+             the summary is posted either way. */
+          if (req.followUp) {
+            return sendAttachmentMessage(ep, req.followUp)
               .then(function () { return { result: 'ok' }; })
               .catch(function () { return { result: 'ok' }; });
           }
