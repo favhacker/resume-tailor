@@ -495,28 +495,38 @@
     return a;
   }
 
-  function safeFilePart(s, fallback) {
+  function safeFilePart(s, fallback, max) {
     var t = String(s == null ? '' : s)
       .replace(/[\u0000-\u001f\u007f]/g, '')
       .replace(/[^A-Za-z0-9._-]+/g, '-')
       .replace(/^[-.]+|[-.]+$/g, '')
-      .slice(0, 60);
+      .slice(0, max || 40)
+      .replace(/[-.]+$/, '');
     return t || fallback;
   }
 
-  function attachmentName(tpl, company) {
+  function attachmentName(tpl, company, profileName) {
     var d = new Date();
     var p = function (n) { return (n < 10 ? '0' : '') + n; };
     var date = d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate());
-    var name = String(tpl || 'resume-{company}-{date}.json')
+    var name = String(tpl || 'resume-{name}-{company}-{date}.json')
+      .replace(/\{name\}/g, safeFilePart(profileName, 'profile'))
       .replace(/\{company\}/g, safeFilePart(company, 'resume'))
       .replace(/\{date\}/g, date);
-    name = safeFilePart(name, 'resume.json');
+    /* Each placeholder is already capped; clean the assembled name without
+       re-truncating it, or a long name plus a long company would eat the date
+       and the extension. The 150 is only a backstop for a silly template. */
+    name = String(name)
+      .replace(/[\u0000-\u001f\u007f]/g, '')
+      .replace(/[^A-Za-z0-9._-]+/g, '-')
+      .replace(/^[-.]+|[-.]+$/g, '');
+    if (name.length > 150) name = name.slice(0, 150).replace(/[-.]+$/, '');
+    if (!name) name = 'resume';
     return /\.json$/i.test(name) ? name : name + '.json';
   }
 
   /* Returns { filename, content } or null. Never throws. */
-  function buildAttachment(ctx, company) {
+  function buildAttachment(ctx, company, profileName) {
     var a = attachCfg();
     if (!a) return null;
     var raw = ctx && typeof ctx.json === 'string' ? ctx.json : '';
@@ -534,7 +544,7 @@
       warnOnce('attach-big', 'the resume JSON is ' + bytes + ' bytes, over attachJson.maxBytes (' + cap + '); sending the message without it');
       return null;
     }
-    return { filename: attachmentName(a.filename, company), content: text };
+    return { filename: attachmentName(a.filename, company, profileName), content: text };
   }
 
   /* --------------------------------------------------- discord format --- */
@@ -1029,7 +1039,7 @@
          now would still be visible there. */
       var outgoing = env;
       if (type === 'resume.generated' && ep.type === 'discord') {
-        var att = buildAttachment(ctx, data.company);
+        var att = buildAttachment(ctx, data.company, data.profileName);
         if (att) {
           outgoing = {};
           for (var k in env) if (env.hasOwnProperty(k)) outgoing[k] = env[k];

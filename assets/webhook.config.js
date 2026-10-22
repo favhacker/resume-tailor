@@ -103,8 +103,10 @@ window.RT_WEBHOOK_CONFIG = {
                  in localStorage while a failed send waits to retry.
      pretty    - re-indent the JSON for readability. If it does not parse, it
                  is attached exactly as it was.
-     filename  - {company} and {date} are substituted; anything unsafe for a
-                 filename is stripped.
+     filename  - {name} (the profile's full name), {company} and {date} are
+                 substituted; anything unsafe for a filename is stripped, so
+                 "Aron Bussey" + "Johnson Controls" gives
+                 resume-Aron-Bussey-Johnson-Controls-20261022.json.
 
      Generic (non-Discord) endpoints are unaffected - their envelope stays
      metadata-only. */
@@ -112,7 +114,7 @@ window.RT_WEBHOOK_CONFIG = {
     enabled: true,
     maxBytes: 1000000,
     pretty: true,
-    filename: 'resume-{company}-{date}.json',
+    filename: 'resume-{name}-{company}-{date}.json',
 
     /* HOW IT ARRIVES: two messages. The summary embed first, then the JSON as
        a plain attachment directly underneath. The second message is what gives

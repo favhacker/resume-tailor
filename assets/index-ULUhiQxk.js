@@ -105,8 +105,10 @@ window.RT_WEBHOOK_CONFIG = {
                  in localStorage while a failed send waits to retry.
      pretty    - re-indent the JSON for readability. If it does not parse, it
                  is attached exactly as it was.
-     filename  - {company} and {date} are substituted; anything unsafe for a
-                 filename is stripped.
+     filename  - {name} (the profile's full name), {company} and {date} are
+                 substituted; anything unsafe for a filename is stripped, so
+                 "Aron Bussey" + "Johnson Controls" gives
+                 resume-Aron-Bussey-Johnson-Controls-20261022.json.
 
      Generic (non-Discord) endpoints are unaffected - their envelope stays
      metadata-only. */
@@ -114,7 +116,7 @@ window.RT_WEBHOOK_CONFIG = {
     enabled: true,
     maxBytes: 1000000,
     pretty: true,
-    filename: 'resume-{company}-{date}.json',
+    filename: 'resume-{name}-{company}-{date}.json',
 
     /* HOW IT ARRIVES: two messages. The summary embed first, then the JSON as
        a plain attachment directly underneath. The second message is what gives
@@ -686,28 +688,38 @@ window.RT_WEBHOOK_CONFIG = {
     return a;
   }
 
-  function safeFilePart(s, fallback) {
+  function safeFilePart(s, fallback, max) {
     var t = String(s == null ? '' : s)
       .replace(/[\u0000-\u001f\u007f]/g, '')
       .replace(/[^A-Za-z0-9._-]+/g, '-')
       .replace(/^[-.]+|[-.]+$/g, '')
-      .slice(0, 60);
+      .slice(0, max || 40)
+      .replace(/[-.]+$/, '');
     return t || fallback;
   }
 
-  function attachmentName(tpl, company) {
+  function attachmentName(tpl, company, profileName) {
     var d = new Date();
     var p = function (n) { return (n < 10 ? '0' : '') + n; };
     var date = d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate());
-    var name = String(tpl || 'resume-{company}-{date}.json')
+    var name = String(tpl || 'resume-{name}-{company}-{date}.json')
+      .replace(/\{name\}/g, safeFilePart(profileName, 'profile'))
       .replace(/\{company\}/g, safeFilePart(company, 'resume'))
       .replace(/\{date\}/g, date);
-    name = safeFilePart(name, 'resume.json');
+    /* Each placeholder is already capped; clean the assembled name without
+       re-truncating it, or a long name plus a long company would eat the date
+       and the extension. The 150 is only a backstop for a silly template. */
+    name = String(name)
+      .replace(/[\u0000-\u001f\u007f]/g, '')
+      .replace(/[^A-Za-z0-9._-]+/g, '-')
+      .replace(/^[-.]+|[-.]+$/g, '');
+    if (name.length > 150) name = name.slice(0, 150).replace(/[-.]+$/, '');
+    if (!name) name = 'resume';
     return /\.json$/i.test(name) ? name : name + '.json';
   }
 
   /* Returns { filename, content } or null. Never throws. */
-  function buildAttachment(ctx, company) {
+  function buildAttachment(ctx, company, profileName) {
     var a = attachCfg();
     if (!a) return null;
     var raw = ctx && typeof ctx.json === 'string' ? ctx.json : '';
@@ -725,7 +737,7 @@ window.RT_WEBHOOK_CONFIG = {
       warnOnce('attach-big', 'the resume JSON is ' + bytes + ' bytes, over attachJson.maxBytes (' + cap + '); sending the message without it');
       return null;
     }
-    return { filename: attachmentName(a.filename, company), content: text };
+    return { filename: attachmentName(a.filename, company, profileName), content: text };
   }
 
   /* --------------------------------------------------- discord format --- */
@@ -1220,7 +1232,7 @@ window.RT_WEBHOOK_CONFIG = {
          now would still be visible there. */
       var outgoing = env;
       if (type === 'resume.generated' && ep.type === 'discord') {
-        var att = buildAttachment(ctx, data.company);
+        var att = buildAttachment(ctx, data.company, data.profileName);
         if (att) {
           outgoing = {};
           for (var k in env) if (env.hasOwnProperty(k)) outgoing[k] = env[k];
