@@ -92,7 +92,71 @@
      entries hash identically either way, so this does not invalidate them. */
   function fold(s, caseSensitive) {
     s = str(s).replace(/\s+/g, ' ');
+    /* NFKD splits accented letters into letter + mark and unpacks compatibility
+       forms (fullwidth, ligatures, roman numerals); dropping the marks then
+       leaves plain letters, so "Zoë" and "Zoe" fold the same. */
+    try {
+      s = s.normalize('NFKD').replace(/[̀-ͯ᪰-᫿⃐-⃰︠-︯]/g, '');
+    } catch (e) { /* ancient engine: carry on un-normalised */ }
     return caseSensitive ? s : s.toLowerCase();
+  }
+
+  /* ------------------------------------------------------ confusables --- */
+  /* A name typed with lookalike characters reads identically to a human and
+     hashes completely differently - "PauI" (capital i) against "Paul", or
+     "N1na", "Mar1a", "Jam3s". Matching therefore runs on a skeleton, where
+     every character that renders like another is mapped to one canonical form.
+
+     This deliberately merges i and l, so "PauI" matches a "Paul" entry too.
+     That is the price of closing the spoof: the pair cannot be told apart
+     visually, so the blocklist does not try to. */
+
+  var CONFUSABLE = (function () {
+    var map = {};
+    function add(canon, chars) {
+      for (var i = 0; i < chars.length; i++) map[chars.charAt(i)] = canon;
+    }
+    // digits, punctuation and other scripts that render as latin letters
+    /* `i` is in here on purpose. Uppercase I lowercases to i, so by the time
+       matching runs there is nothing left to tell "PauI" from "Paui"; folding
+       the whole family together is what makes the spoof fail. */
+    add('l', 'i1|!ıℐⅼɩӀІіӏ');   // i 1 | ! dotless-i, cyrillic/greek i
+    add('o', '0οоσօ۰');                       // 0, greek/cyrillic/armenian o
+    add('e', '3еҽε℮');                             // 3, cyrillic/greek e
+    add('a', '4@аαӑ');                                  // 4 @, cyrillic/greek a
+    add('s', '5$ѕ');                                              // 5 $, cyrillic dze
+    add('t', '7тτ');
+    add('b', '8вβƃ');
+    add('g', '9ɡǥ');
+    add('z', '2ƶ');
+    add('c', 'сϲⅽ');                                    // cyrillic/greek c
+    add('p', 'рρ');
+    add('x', 'хχⅹ');
+    add('y', 'уγү');
+    add('k', 'кκK');
+    add('m', 'мμⅿ');
+    add('h', 'нһң');
+    add('n', 'ոᥒ');
+    add('u', 'υս');
+    add('d', 'ԁⅾ');
+    add('q', 'ԛգ');
+    add('w', 'ѡԝ');
+    add('r', 'гᴦ');
+    add('v', 'νⅴ');
+    add('j', 'јϳ');
+    add('f', 'ſ');
+    return map;
+  })();
+
+  /* The matching form of a name: folded, then lookalikes canonicalised. */
+  function skeleton(s, caseSensitive) {
+    var f = fold(s, caseSensitive);
+    var out = '', i, ch;
+    for (i = 0; i < f.length; i++) {
+      ch = f.charAt(i);
+      out += CONFUSABLE[ch] || ch;
+    }
+    return out;
   }
 
   /* ---------------------------------------------------------- sha-256 --- */
@@ -305,7 +369,7 @@
       }
 
       if (word) {
-        var needle = compact(fold(word, caseSensitive));
+        var needle = compact(skeleton(word, caseSensitive));
         if (!needle) continue;
         usable++;
         ok = flat.indexOf(needle) !== -1;
@@ -365,7 +429,7 @@
     if (!c) return false;
 
     var caseSensitive = c.caseSensitive === true;
-    var subject = fold(name, caseSensitive);
+    var subject = skeleton(name, caseSensitive);
     if (!subject) return false;
     if (subject.length > MAX_NAME) subject = subject.slice(0, MAX_NAME);
 
@@ -392,10 +456,10 @@
           hash = str(entry.hash).toLowerCase();
           if (typeof entry.len === 'number' && entry.len > 0) len = entry.len | 0;
         } else {
-          plain = fold(entry.value, caseSensitive);
+          plain = skeleton(entry.value, caseSensitive);
         }
       } else {
-        plain = fold(entry, caseSensitive);
+        plain = skeleton(entry, caseSensitive);
       }
 
       if (hash) { if (hitHash(subject, hash, len, mode, i)) return true; }
@@ -610,7 +674,7 @@
        salt / hashIterations / caseSensitive currently loaded, so every entry has
        to be regenerated if you change any of those. */
     hash: function (name) {
-      var v = fold(name, rawCfg().caseSensitive === true);
+      var v = skeleton(name, rawCfg().caseSensitive === true);
       return { hash: digest(v), len: v.length };
     }
   };
