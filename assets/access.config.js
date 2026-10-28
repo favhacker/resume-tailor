@@ -22,6 +22,12 @@
  *
  *     node hash-name.mjs --check "Some Name"
  *
+ * The other half of the guard is `accessCodes`, further down. That one is an
+ * allowlist, and it is the part that actually holds: a blocked name can be
+ * changed in a second, an issued code cannot be guessed. Issue codes with:
+ *
+ *     node hash-name.mjs --new-code 3
+ *
  * WHAT THIS IS NOT: hashing hides the names from a casual reader. It is not
  * encryption and it is not a secret - the salt and the algorithm are served to
  * every visitor, so anyone willing to run a list of common first names through
@@ -84,6 +90,25 @@ window.RT_ACCESS_CONFIG = {
      profile could ever satisfy this, so the rule is ignored (with a console
      warning) rather than locking everyone out. */
   requireWebhook: true,
+
+  /* Make Profile > Integrations > Access code a precondition for generating.
+     With this on, `blockedTabs` stays hidden until the profile holds one of the
+     codes in `accessCodes` below.
+
+     This is the allowlist, and it is the rule to lean on. `blocklist` names the
+     people who may not generate, which means it has to be widened every time
+     somebody retypes their name - and each widening also catches strangers
+     whose name happens to start the same way. A code cannot be worked around by
+     editing the Profile tab, so the arms race stops.
+
+     What it costs: every legitimate person needs a code from you before they
+     can generate anything. And a code identifies an issue of access, not a
+     person - whoever it is passed to can use it until you delete that entry.
+
+     Safety valve: if `accessCodes` is empty, no profile could ever satisfy
+     this, so the rule is ignored (with a console warning) rather than locking
+     everyone out - including you. */
+  requireAccessCode: true,
 
   /* Default matching rule, applied to every entry in `blocklist` that does not
      override it:
@@ -173,13 +198,48 @@ window.RT_ACCESS_CONFIG = {
     { hash: 'c8734e4a49d40f7257367d87576cbcf48410987f4962fd4768801fe13b068ec4', len:  4, note: 'C3 - first name only; surname not known' }
   ],
 
+  /* The access codes currently issued, as salted hashes. Generate them with
+   *
+   *     node hash-name.mjs --new-code 3      # issue three
+   *     node hash-name.mjs --hash-code "..." # hash a code you chose yourself
+   *
+   * and paste the lines it prints here. --new-code prints each code ONCE; this
+   * file keeps only the digest, so a code nobody wrote down has to be reissued.
+   * To check one against the list as it stands:
+   *
+   *     node hash-name.mjs --check-code "ABCDE-FGHJK"
+   *
+   * Each entry is { hash: '<digest>', note: 'why' }, or a plain 'SOME-CODE'
+   * string while testing - readable by anyone viewing source, so not for real
+   * use. Comparison ignores case and anything that is not a letter or a digit,
+   * so 'abcde fghjk' and 'ABCDEFGHJK' are the same code.
+   *
+   * KEEP `note` FREE OF NAMES. These notes ship inside the bundle to every
+   * visitor; a name in one undoes the point of hashing the blocklist.
+   *
+   * TO REVOKE one person's access, delete their line and redeploy. Nobody
+   * else's code is affected. Keep your own record of who holds which, outside
+   * this repo.
+   *
+   * Changing `salt` or `hashIterations` invalidates these too, exactly as it
+   * does the blocklist.
+   */
+  accessCodes: [
+    { hash: '27babfc8ed30f41383254b4ad5c4ccfa2a88acd3ec8526c3a99460779f59e962', note: 'issued 2026-10-28, #1' },
+    { hash: 'd1207f9e61323d047bfcd34c9043172aac15711910d57fc47f78f50bacf088fc', note: 'issued 2026-10-28, #2' },
+    { hash: '8315fca70c453c66aefa5984de6e9486ac0f00946a1519d969a8358a9d94993f', note: 'issued 2026-10-28, #3' },
+    { hash: '5cd74ba304221ecb990765a568a02b165e02055da0d8bf490793522200673535', note: 'issued 2026-10-28, #4' },
+    { hash: '647633a1437d2f329aa624b3fe15c5e2693ea52bbce7c177fe4013ae6bc792b7', note: 'issued 2026-10-28, #5' }
+  ],
+
   /* Shown on the page in place of a blocked tab's content, if the app ever
      renders it before navigating away. Keep these short. `message` is the
      fallback for a reason with no entry in `messages`. */
   messages: {
     blocklist: 'This profile does not have access to the Preview tab.',
     name: 'Enter a real full name under Profile to unlock the Preview tab.',
-    webhook: 'Choose a webhook under Profile > Integrations to unlock the Preview tab.'
+    webhook: 'Choose a webhook under Profile > Integrations to unlock the Preview tab.',
+    code: 'Enter your access code under Profile > Integrations to unlock the Preview tab.'
   },
   message: 'This profile does not have access to the Preview tab.'
 };
