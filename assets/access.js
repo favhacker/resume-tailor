@@ -13,8 +13,6 @@
  *   name      - the name cannot be anybody's name ("\", "123", "a", "asdf!!")
  *   webhook   - `requireWebhook` is on and Profile > Integrations > Webhook is
  *               unset, or points at an id webhook.config.js no longer lists
- *   code      - `requireAccessCode` is on and Profile > Integrations > Access
- *               code does not hold one of the issued codes
  *
  * Exposes:
  *
@@ -22,12 +20,9 @@
  *                                          profile is saved (every autosave)
  *   window.RTAccess.blockedTabs()        - ['preview'] etc, or [] when allowed
  *   window.RTAccess.isBlockedTab(id)     - convenience for one tab id
- *   window.RTAccess.reason()             - 'blocklist' | 'name' | 'webhook' |
- *                                          'code' | null
+ *   window.RTAccess.reason()             - 'blocklist' | 'webhook' | null
  *   window.RTAccess.requiresWebhook()    - is a webhook a precondition here?
  *   window.RTAccess.hasWebhook()         - does the profile satisfy it?
- *   window.RTAccess.requiresCode()       - is an access code a precondition?
- *   window.RTAccess.codeAccepted(code)   - is this code one of the issued ones?
  *   window.RTAccess.isBlocked(name)      - the raw name test, for any caller
  *   window.RTAccess.fallbackTab()        - tab to fall back to when kicked out
  *   window.RTAccess.message(reason)      - text to show in a blocked tab
@@ -39,7 +34,7 @@
  *
  *   document.addEventListener('resume-tailor:access-changed', e => {
  *     e.detail.blockedTabs  // string[]
- *     e.detail.reason       // 'blocklist' | 'name' | 'webhook' | 'code' | null
+ *     e.detail.reason       // 'blocklist' | 'webhook' | null
  *   });
  *
  * The profile name never leaves the page - this file makes no requests.
@@ -62,7 +57,7 @@
   var MAX_NAME = 120;     // longer input is truncated before hashing
   var MAX_CACHE = 512;
 
-  var currentProfile = { name: '', webhookId: '', accessCode: '' };
+  var currentProfile = { name: '', webhookId: '' };
   var currentTabs = [];
   var currentReason = null;
   var warned = {};
@@ -560,97 +555,12 @@
     return false;   // selected, but no longer listed in webhook.config.js
   }
 
-  /* ------------------------------------------------ access code rule --- */
-  /* `requireAccessCode` makes Profile > Integrations > Access code a
-     precondition. This is the inverse of the blocklist: instead of naming the
-     people who may not generate, it admits only the people holding a code that
-     was issued to them. Renaming therefore achieves nothing, which is the whole
-     point - a blocklist has to be widened after every evasion, and each
-     widening catches bystanders whose name merely starts the same way.
-
-     What it does not do: a code can be passed on. It identifies an issue of
-     access, not a person, so a shared code admits everyone it reaches until
-     that entry is deleted from `accessCodes`.
-
-     Codes are stored as salted hashes, like the names, and the usual caveat
-     applies with much less force - a random code has far too much entropy to
-     recover from its digest, unlike a common first name. */
-
-  /* Letters and digits only, uppercased, so '7kqp-ra9m', '7KQP RA9M' and
-     '7kqpra9m' are one code and a stray space on paste is harmless.
-
-     Deliberately NOT skeleton(): folding i/l/0/o together is right for a name
-     typed to look like someone else's, and wrong here, where it would throw
-     away a chunk of the entropy the code depends on. */
-  function codeKey(v) {
-    return str(v).replace(/[^0-9A-Za-z]+/g, '').toUpperCase();
-  }
-
-  /* Domain-separated from the name digests, so neither list can match the
-     other's entries and neither reveals anything about the other. */
-  function digestCode(key) {
-    return digest('code\u001f' + key);
-  }
-
-  function codeEntries() {
-    var c = cfg();
-    var list = c && Array.isArray(c.accessCodes) ? c.accessCodes : [];
-    var out = [], i, e, h, v;
-
-    for (i = 0; i < list.length; i++) {
-      e = list[i];
-      if (e && typeof e === 'object') {
-        h = str(e.hash).toLowerCase();
-        if (HEX64.test(h)) { out.push({ hash: h }); continue; }
-        v = codeKey(e.value);
-        if (v) { out.push({ value: v }); continue; }
-        warnOnce('code-' + i, 'access.config.js accessCodes entry #' + (i + 1) + ' has neither a 64-character hash nor a value; skipped');
-        continue;
-      }
-      h = str(e).toLowerCase();
-      if (HEX64.test(h)) { out.push({ hash: h }); continue; }
-      /* A plain code, readable by anyone viewing source. Accepted because it is
-         handy while testing; `node hash-name.mjs --new-code` is the real way. */
-      v = codeKey(e);
-      if (v) out.push({ value: v });
-    }
-    return out;
-  }
-
-  function requiresCode() {
-    var c = cfg();
-    if (!c || c.requireAccessCode !== true) return false;
-    /* An empty list would admit nobody at all, including whoever owns the
-       deployment. Same safety valve as requireWebhook. */
-    if (codeEntries().length === 0) {
-      warnOnce('rc-empty', 'access.config.js sets requireAccessCode: true, but accessCodes is empty, so no profile could ever satisfy it. The requirement is ignored until at least one code exists - generate one with: node hash-name.mjs --new-code');
-      return false;
-    }
-    return true;
-  }
-
-  /* True when `code` is one of the issued ones. Safe to call with anything. */
-  function codeAccepted(code) {
-    var key = codeKey(code);
-    if (!key) return false;
-
-    var list = codeEntries(), mine = null, i;
-    for (i = 0; i < list.length; i++) {
-      if (list[i].hash) {
-        if (mine === null) mine = digestCode(key);
-        if (mine === list[i].hash) return true;
-      } else if (list[i].value === key) return true;
-    }
-    return false;
-  }
-
-  /* 'blocklist', 'name', 'webhook', 'code', or null when the profile is fine. */
+  /* 'blocklist', 'name', 'webhook', or null when the profile is fine. */
   function reasonFor(p) {
     if (!cfg()) return null;
     if (isBlocked(p.name)) return 'blocklist';
     if (implausibleName(p.name)) return 'name';
     if (requiresWebhook() && !hasWebhook(p.webhookId)) return 'webhook';
-    if (requiresCode() && !codeAccepted(p.accessCode)) return 'code';
     return null;
   }
 
@@ -719,8 +629,8 @@
 
   function setProfile(profile) {
     currentProfile = profile && typeof profile === 'object'
-      ? { name: str(profile.fullName), webhookId: str(profile.webhookId), accessCode: str(profile.accessCode) }
-      : { name: str(profile), webhookId: '', accessCode: '' };
+      ? { name: str(profile.fullName), webhookId: str(profile.webhookId) }
+      : { name: str(profile), webhookId: '' };
     return refresh();
   }
 
@@ -731,7 +641,7 @@
       var raw = localStorage.getItem(PROFILE_KEY);
       if (raw) {
         var saved = JSON.parse(raw);
-        currentProfile = { name: str(saved.fullName), webhookId: str(saved.webhookId), accessCode: str(saved.accessCode) };
+        currentProfile = { name: str(saved.fullName), webhookId: str(saved.webhookId) };
       }
     } catch (e) { /* no storage, or not JSON - treat as no profile */ }
     currentReason = reasonFor(currentProfile);
@@ -760,26 +670,12 @@
     requiresWebhook: requiresWebhook,
     /* Does the current profile point at an endpoint that still exists? */
     hasWebhook: function () { return hasWebhook(currentProfile.webhookId); },
-    /* Is an access code currently a precondition? False when the rule is off,
-       and when `accessCodes` is empty, which would otherwise admit nobody. */
-    requiresCode: requiresCode,
-    /* Is this code one of the issued ones? The Profile tab uses it to tell
-       "not typed yet" apart from "typed, but wrong". */
-    codeAccepted: codeAccepted,
-    /* Does the code saved in the profile pass? */
-    hasCode: function () { return codeAccepted(currentProfile.accessCode); },
     /* Turn a name into the { hash, len } pair that goes in the config. Uses the
        salt / hashIterations / caseSensitive currently loaded, so every entry has
        to be regenerated if you change any of those. */
     hash: function (name) {
       var v = skeleton(name, rawCfg().caseSensitive === true);
       return { hash: digest(v), len: v.length };
-    },
-    /* The digest for an `accessCodes` entry, plus the normalised code it came
-       from. See hash-name.mjs --new-code. */
-    hashCode: function (code) {
-      var k = codeKey(code);
-      return { hash: digestCode(k), key: k };
     }
   };
 
