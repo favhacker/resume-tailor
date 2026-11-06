@@ -2357,9 +2357,11 @@ Modify the major only if it is not related to the job description.
 - Each major should be common in the industry.
 EXPERIENCE – SENTENCE RULES (STRICT)
 - DO NOT include the name or pronouns such as he or she
+- Experience sentences should highlight the technologies mentioned in the job description.
 - Each sentence must be 150–250 characters and contain detailed, technically rich descriptions of your role, specific contributions, and technologies used.
 - Each sentence must end with a period
 - Each experience must reference company industry relevance and career growth
+- Ensure that these technologies are included only after their first version (or alpha release date). This ensures the technology's maturity is reflected in your experience.
 - No sentence may be vague or generic
 - No bullet symbols
 
