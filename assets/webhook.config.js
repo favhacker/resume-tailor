@@ -50,6 +50,10 @@ window.RT_WEBHOOK_CONFIG = {
    *                                   Left out, a Discord url is detected
    *                                   automatically.
    *   url   - where events are POSTed. Must be http(s).
+   *   encryptedUrl - use instead of `url` to keep it out of the repo as plain
+   *           text. Generate with: node encrypt-webhook.mjs "<url>"
+   *           Give `type` explicitly with it, since the url cannot be
+   *           inspected until the page has decrypted it.
    *   mode  - optional, per-endpoint override of the global `mode` below
    *           (always 'cors' for Discord, which requires JSON).
    *   headers - optional, per-endpoint extra headers (merged over the global).
@@ -62,13 +66,14 @@ window.RT_WEBHOOK_CONFIG = {
    *   threadName - for forum/media channels: create a thread with this name.
    *                Discord requires threadId or threadName for those channels.
    *
-   * These URLs ship to the browser and are readable by anyone viewing source.
-   * A Discord webhook url contains its token, so anyone who can see it can
-   * post to (or delete) the webhook. Do not publish one you are not willing to
-   * have abused; regenerate it in Discord if it leaks.
+   * These URLs ship to the browser. encryptedUrl hides one from the repo and
+   * from scrapers, but the key ships too and the decrypted url is visible in
+   * devtools whenever an event is sent. A Discord webhook url contains its
+   * token, so anyone who gets it can post to (or delete) the webhook.
+   * Regenerate it in Discord if it is abused.
    */
   endpoints: [
-    { id: "Olek's Server", label: 'oleks-discord', type: 'discord', url: 'https://discord.com/api/webhooks/1569425276138430474/FAps3WJIKaveBWN8SFA4LIUzRPVnm9ZoeTPAPKaDJ8mjZ062vvY2Ldj33UNjFyQeGCPL' },
+    { id: "Olek's Server", label: 'oleks-discord', type: 'discord', encryptedUrl: 'thDdYycKyxXzSlFxV7t_a6Ndsj3P3-Ps8_ULO8oCpbfSQ8pGsiUeOos3Xi1KmhvWTfzxcTKx-GINaewmVvx0XeH74AVs3R05iGTVUTYz7IdCtYlka6foGehmWT2dnc81tQozSwXdHuK9c_tvyk4x1-CFuvvqJ7CNXZ37dxmgPUkaSnoDBGUveP9ICdtbCnK9np5-_FA' },
   ],
 
   // Used when a profile has nothing selected yet. Leave '' to default to None.

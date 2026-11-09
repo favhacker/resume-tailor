@@ -76,6 +76,46 @@
     try { console.log.apply(console, arguments); } catch (e) { /* no console */ }
   }
 
+  /* ------------------------------------------------- encrypted urls --- */
+  /* AES-256-GCM key for `encryptedUrl` in webhook.config.js. It ships with the
+     page, so it keeps the url out of the repo as plain text (and away from
+     scrapers that grep for webhook urls), not away from someone reading this
+     file. encrypt-webhook.mjs reads it from here; changing it means
+     re-encrypting every endpoint. */
+  var URL_KEY = '6r1N7XVrYnr5n01oCcvBhThBOlq7wiXhvlb0Bey2MW0';
+
+  function b64bytes(s) {
+    var bin = atob(String(s).replace(/-/g, '+').replace(/_/g, '/'));
+    var out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  // token is base64url(iv[12] || ciphertext+tag), as printed by encrypt-webhook.mjs
+  function decryptWebhookUrl(token) {
+    var raw = b64bytes(token);
+    return crypto.subtle.importKey('raw', b64bytes(URL_KEY), { name: 'AES-GCM' }, false, ['decrypt'])
+      .then(function (key) {
+        return crypto.subtle.decrypt({ name: 'AES-GCM', iv: raw.slice(0, 12) }, key, raw.slice(12));
+      })
+      .then(function (buf) { return new TextDecoder().decode(buf); });
+  }
+
+  /* Endpoint id -> decrypted url, or null when decryption failed. WebCrypto is
+     async, so anything that sends waits on urlsReady first. */
+  var plainUrls = {};
+  var urlsReady = (function () {
+    var c = cfg();
+    var list = c && Array.isArray(c.endpoints) ? c.endpoints : [];
+    return Promise.all(list.map(function (ep) {
+      var id = ep && str(ep.id), token = ep && str(ep.encryptedUrl);
+      if (!id || !token) return null;
+      return Promise.resolve()
+        .then(function () { return decryptWebhookUrl(token); })
+        .then(function (u) { plainUrls[id] = u; }, function () { plainUrls[id] = null; });
+    }));
+  })();
+
   var warned = {};
   function warnOnce(key, msg, extra) {
     if (warned[key]) return;
@@ -103,7 +143,15 @@
       var id = str(ep.id), url = str(ep.url), where = 'webhook.config.js endpoint "' + (id || '#' + (i + 1)) + '"';
       if (!id) { warnOnce('ep-noid-' + i, where + ' has no id; skipped'); continue; }
       if (seen[id]) { warnOnce('ep-dup-' + id, where + ' duplicates an earlier id; skipped'); continue; }
-      if (!isValidUrl(url)) { warnOnce('ep-url-' + id, where + ' has an invalid url; skipped'); continue; }
+
+      // still decrypting: list it for the dropdown, but its url is not known yet
+      var pending = false;
+      if (str(ep.encryptedUrl)) {
+        if (!plainUrls.hasOwnProperty(id)) pending = true;
+        else if (plainUrls[id] === null) { warnOnce('ep-dec-' + id, where + ' has an encryptedUrl that could not be decrypted; skipped'); continue; }
+        else url = plainUrls[id];
+      }
+      if (!pending && !isValidUrl(url)) { warnOnce('ep-url-' + id, where + ' has an invalid url; skipped'); continue; }
 
       var type = str(ep.type).toLowerCase();
       if (!type) {
@@ -123,7 +171,7 @@
       };
 
       if (type === 'discord') {
-        if (!DISCORD_URL.test(url)) {
+        if (!pending && !DISCORD_URL.test(url)) {
           warnOnce('ep-dcurl-' + id, where + ' is type "discord" but the url is not https://discord.com/api/webhooks/{id}/{token}; skipped');
           continue;
         }
@@ -1022,8 +1070,8 @@
     }
     var at = new Date().toISOString();
 
-    return lookupClient().then(function (client) {
-      data.client = client;
+    return Promise.all([lookupClient(), urlsReady]).then(function (r) {
+      data.client = r[0];
       var env = envelope(type, data);
       env.occurredAt = at;
       var ep = resolve();
@@ -1097,8 +1145,10 @@
 
   // retry anything stranded by a previous session
   try {
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', function () { flush(); });
-    } else { flush(); }
+    urlsReady.then(function () {
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', function () { flush(); });
+      } else { flush(); }
+    });
   } catch (e) { /* ignore */ }
 })();

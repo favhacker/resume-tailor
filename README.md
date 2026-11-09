@@ -35,6 +35,7 @@ Then open <http://localhost:8080/>.
 | `.nojekyll`               | Stops GitHub Pages from running Jekyll on the site      |
 | `embed-access.mjs`        | Bakes the two configs + their runtimes into the bundle   |
 | `hash-name.mjs`           | Turns a name into a blocklist entry                     |
+| `encrypt-webhook.mjs`     | Turns a webhook url into an `encryptedUrl` config value |
 | `stamp-cache-version.mjs` | Refreshes the `?v=` cache markers in `index.html`       |
 
 ## Changing who can generate resumes

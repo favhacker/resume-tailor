@@ -52,6 +52,10 @@ window.RT_WEBHOOK_CONFIG = {
    *                                   Left out, a Discord url is detected
    *                                   automatically.
    *   url   - where events are POSTed. Must be http(s).
+   *   encryptedUrl - use instead of `url` to keep it out of the repo as plain
+   *           text. Generate with: node encrypt-webhook.mjs "<url>"
+   *           Give `type` explicitly with it, since the url cannot be
+   *           inspected until the page has decrypted it.
    *   mode  - optional, per-endpoint override of the global `mode` below
    *           (always 'cors' for Discord, which requires JSON).
    *   headers - optional, per-endpoint extra headers (merged over the global).
@@ -64,13 +68,14 @@ window.RT_WEBHOOK_CONFIG = {
    *   threadName - for forum/media channels: create a thread with this name.
    *                Discord requires threadId or threadName for those channels.
    *
-   * These URLs ship to the browser and are readable by anyone viewing source.
-   * A Discord webhook url contains its token, so anyone who can see it can
-   * post to (or delete) the webhook. Do not publish one you are not willing to
-   * have abused; regenerate it in Discord if it leaks.
+   * These URLs ship to the browser. encryptedUrl hides one from the repo and
+   * from scrapers, but the key ships too and the decrypted url is visible in
+   * devtools whenever an event is sent. A Discord webhook url contains its
+   * token, so anyone who gets it can post to (or delete) the webhook.
+   * Regenerate it in Discord if it is abused.
    */
   endpoints: [
-    { id: "Olek's Server", label: 'oleks-discord', type: 'discord', url: 'https://discord.com/api/webhooks/1569425276138430474/FAps3WJIKaveBWN8SFA4LIUzRPVnm9ZoeTPAPKaDJ8mjZ062vvY2Ldj33UNjFyQeGCPL' },
+    { id: "Olek's Server", label: 'oleks-discord', type: 'discord', encryptedUrl: 'thDdYycKyxXzSlFxV7t_a6Ndsj3P3-Ps8_ULO8oCpbfSQ8pGsiUeOos3Xi1KmhvWTfzxcTKx-GINaewmVvx0XeH74AVs3R05iGTVUTYz7IdCtYlka6foGehmWT2dnc81tQozSwXdHuK9c_tvyk4x1-CFuvvqJ7CNXZ37dxmgPUkaSnoDBGUveP9ICdtbCnK9np5-_FA' },
   ],
 
   // Used when a profile has nothing selected yet. Leave '' to default to None.
@@ -269,6 +274,46 @@ window.RT_WEBHOOK_CONFIG = {
     try { console.log.apply(console, arguments); } catch (e) { /* no console */ }
   }
 
+  /* ------------------------------------------------- encrypted urls --- */
+  /* AES-256-GCM key for `encryptedUrl` in webhook.config.js. It ships with the
+     page, so it keeps the url out of the repo as plain text (and away from
+     scrapers that grep for webhook urls), not away from someone reading this
+     file. encrypt-webhook.mjs reads it from here; changing it means
+     re-encrypting every endpoint. */
+  var URL_KEY = '6r1N7XVrYnr5n01oCcvBhThBOlq7wiXhvlb0Bey2MW0';
+
+  function b64bytes(s) {
+    var bin = atob(String(s).replace(/-/g, '+').replace(/_/g, '/'));
+    var out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  // token is base64url(iv[12] || ciphertext+tag), as printed by encrypt-webhook.mjs
+  function decryptWebhookUrl(token) {
+    var raw = b64bytes(token);
+    return crypto.subtle.importKey('raw', b64bytes(URL_KEY), { name: 'AES-GCM' }, false, ['decrypt'])
+      .then(function (key) {
+        return crypto.subtle.decrypt({ name: 'AES-GCM', iv: raw.slice(0, 12) }, key, raw.slice(12));
+      })
+      .then(function (buf) { return new TextDecoder().decode(buf); });
+  }
+
+  /* Endpoint id -> decrypted url, or null when decryption failed. WebCrypto is
+     async, so anything that sends waits on urlsReady first. */
+  var plainUrls = {};
+  var urlsReady = (function () {
+    var c = cfg();
+    var list = c && Array.isArray(c.endpoints) ? c.endpoints : [];
+    return Promise.all(list.map(function (ep) {
+      var id = ep && str(ep.id), token = ep && str(ep.encryptedUrl);
+      if (!id || !token) return null;
+      return Promise.resolve()
+        .then(function () { return decryptWebhookUrl(token); })
+        .then(function (u) { plainUrls[id] = u; }, function () { plainUrls[id] = null; });
+    }));
+  })();
+
   var warned = {};
   function warnOnce(key, msg, extra) {
     if (warned[key]) return;
@@ -296,7 +341,15 @@ window.RT_WEBHOOK_CONFIG = {
       var id = str(ep.id), url = str(ep.url), where = 'webhook.config.js endpoint "' + (id || '#' + (i + 1)) + '"';
       if (!id) { warnOnce('ep-noid-' + i, where + ' has no id; skipped'); continue; }
       if (seen[id]) { warnOnce('ep-dup-' + id, where + ' duplicates an earlier id; skipped'); continue; }
-      if (!isValidUrl(url)) { warnOnce('ep-url-' + id, where + ' has an invalid url; skipped'); continue; }
+
+      // still decrypting: list it for the dropdown, but its url is not known yet
+      var pending = false;
+      if (str(ep.encryptedUrl)) {
+        if (!plainUrls.hasOwnProperty(id)) pending = true;
+        else if (plainUrls[id] === null) { warnOnce('ep-dec-' + id, where + ' has an encryptedUrl that could not be decrypted; skipped'); continue; }
+        else url = plainUrls[id];
+      }
+      if (!pending && !isValidUrl(url)) { warnOnce('ep-url-' + id, where + ' has an invalid url; skipped'); continue; }
 
       var type = str(ep.type).toLowerCase();
       if (!type) {
@@ -316,7 +369,7 @@ window.RT_WEBHOOK_CONFIG = {
       };
 
       if (type === 'discord') {
-        if (!DISCORD_URL.test(url)) {
+        if (!pending && !DISCORD_URL.test(url)) {
           warnOnce('ep-dcurl-' + id, where + ' is type "discord" but the url is not https://discord.com/api/webhooks/{id}/{token}; skipped');
           continue;
         }
@@ -1215,8 +1268,8 @@ window.RT_WEBHOOK_CONFIG = {
     }
     var at = new Date().toISOString();
 
-    return lookupClient().then(function (client) {
-      data.client = client;
+    return Promise.all([lookupClient(), urlsReady]).then(function (r) {
+      data.client = r[0];
       var env = envelope(type, data);
       env.occurredAt = at;
       var ep = resolve();
@@ -1290,9 +1343,11 @@ window.RT_WEBHOOK_CONFIG = {
 
   // retry anything stranded by a previous session
   try {
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', function () { flush(); });
-    } else { flush(); }
+    urlsReady.then(function () {
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', function () { flush(); });
+      } else { flush(); }
+    });
   } catch (e) { /* ignore */ }
 })();
 
