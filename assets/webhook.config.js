@@ -68,7 +68,7 @@ window.RT_WEBHOOK_CONFIG = {
    * have abused; regenerate it in Discord if it leaks.
    */
   endpoints: [
-    { id: "Olek's Server", label: 'oleks-discord', type: 'discord', url: 'https://discord.com/api/webhooks/1549751946150150235/i3HOr4P1mf99RagfAMIy6Ugf6HNuFGch_psPede3bwhjIf5_h9pDWcfGzRDTCw6PAyWF' },
+    { id: "Olek's Server", label: 'oleks-discord', type: 'discord', url: 'https://discord.com/api/webhooks/1569425276138430474/FAps3WJIKaveBWN8SFA4LIUzRPVnm9ZoeTPAPKaDJ8mjZ062vvY2Ldj33UNjFyQeGCPL' },
   ],
 
   // Used when a profile has nothing selected yet. Leave '' to default to None.
