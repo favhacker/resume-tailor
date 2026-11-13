@@ -6,6 +6,7 @@
  *
  *     node hash-name.mjs "Some Name" "Another Name"
  *     node hash-name.mjs --words "First Last"  # match these words in any order
+ *     node hash-name.mjs --surname "First Last"  # surname + first initial ("F. Last")
  *     node hash-name.mjs --new-salt        # print a fresh random salt
  *     node hash-name.mjs --check "Some Name"   # is this name blocked right now?
  *
@@ -88,6 +89,26 @@ if (check) {
   for (const name of names) {
     console.log(`${isBlocked(name) ? 'BLOCKED' : 'allowed'}  ${JSON.stringify(name)}`);
   }
+  process.exit(0);
+}
+
+if (args.includes('--surname')) {
+  console.log(`salt set: ${!!String(cfg.salt || '').trim()}   hashIterations: ${cfg.hashIterations ?? 1}   caseSensitive: ${cfg.caseSensitive === true}\n`);
+  console.log('Paste into the `blocklist` array in assets/access.config.js:\n');
+  for (const name of names) {
+    const parts = name.split(/\s+/).map((w) => w.trim()).filter(Boolean);
+    if (parts.length < 2) {
+      console.error(`  "${name}" needs a first name (or initial) and a surname, e.g. "M Lastname".`);
+      continue;
+    }
+    const s = hash(parts[parts.length - 1].replace(/[.,]+$/, ''));
+    const i = hash(parts[0].charAt(0));
+    console.log(`    { surname: { hash: '${s.hash}', len: ${s.len} }, initial: { hash: '${i.hash}', len: ${i.len} }, note: '' },`);
+  }
+  console.log('\nMatches the surname together with the first initial of the given name, so');
+  console.log('"M. Last", "Mike Last", "MLast" and "Last, M." are caught, while "Sam Last"');
+  console.log('and someone whose first name is "Last" are not.');
+  console.log("Drop the trailing comma on the last entry and fill in `note`.");
   process.exit(0);
 }
 

@@ -139,6 +139,15 @@ window.RT_ACCESS_CONFIG = {
    *       "First Middle L." all match, while anyone who shares just one part
    *       is untouched. Lower min means broader reach and more collateral.
    *
+   *   { surname: { hash, len }, initial: { hash, len: 1 } } - from
+   *                                               `node hash-name.mjs --surname "First Last"`.
+   *       Matches the surname together with the first initial of the given
+   *       name, which is what answers a first name cut down to an initial:
+   *           F. Last / Fred Last / F J Last / F.Last / FLast / Last, F.
+   *       while "Last" alone, "Sam Last" and someone whose FIRST name is
+   *       "Last" ("Last Miller") are not caught. Reaches anyone with that
+   *       surname and initial, so pair it with a note on who it is for.
+   *
    * `len` is the character count of the hashed name. It lets the page check an
    * entry with a single hash instead of one per prefix, and it is required for
    * `match: 'contains'`. hash-name.mjs prints it for you.
@@ -167,7 +176,8 @@ window.RT_ACCESS_CONFIG = {
     { hash: '9bc795b3bcf26f66c63eb6ace008ce2441432a92de7afa539d1151ea6dba7d59', len:  6, note: 'S2' },
     { hash: 'b1d2e8ad2c5e0a31422096d3bb1f773ab643069566fc7b4456b024b002fe9b5a', len:  4, note: 'K2' },
     { hash: '4dd62701e04a1ddfc78366faff15a3b2d469b3412a76fc1a404cf4d88b9792d3', len:  6, match: 'contains', note: 'R1 - surname, matched anywhere in the name; first name not known' },
-    { hash: 'f7a1ca4a01280bdf545b589fbbbd60a0a409ea08c8a7e087eaea0b712f8581fb', len:  7, note: 'M2 - first name only; surname not known' },
+    { hash: 'f7a1ca4a01280bdf545b589fbbbd60a0a409ea08c8a7e087eaea0b712f8581fb', len:  7, note: 'M2 - first name; surname now known, see M3' },
+    { surname: { hash: '5e38ae0670e14db7d250de91901d4f65f1c75bf33808226d6d4776d7f28c19f6', len: 9 }, initial: { hash: 'a685ea07d062d7cba6cfd97403473f5c5d6c040c8278a29d605557b5bd5c05bf', len: 1 }, note: 'M3 - same person as M2; surname + first initial, after M2 was dodged with an initial' },
     { hash: 'bfa5efc761fb373847b512efc4337cd6916c0cecc4191abd9bc7e321ccfaf509', len:  6, note: 'A4 - first name only; surname not known' },
     { hash: 'b05e512ea9bc91e7fea9615d5189c67d104b0a1deacc2b0e2da463846d5fcac5', len:  4, note: 'L1 - first name only; surname not known' },
     { hash: 'c8734e4a49d40f7257367d87576cbcf48410987f4962fd4768801fe13b068ec4', len:  4, note: 'C3 - first name only; surname not known' }

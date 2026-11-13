@@ -397,6 +397,59 @@
     return usable > 0 && found >= wordsNeeded(entry, usable);
   }
 
+  /* --- surname + first initial, for a first name cut down to an initial --- */
+  /* A first-name entry misses "M. Lastname"; a words entry for "First Last"
+     misses it too, because "First" is gone. A surname entry pairs the surname
+     with the first letter of the given name instead, so these all match:
+       M. Last / Mike Last / Michael J. Last / M.Last / MLast / MichaelLast
+       Last, M. / Last, Michael
+     while "Last" alone, "Sam Last", and someone whose FIRST name is "Last"
+     ("Last Miller") are left alone. Only a token before the surname counts
+     as the given name, unless a comma right after a leading surname marks the
+     name as written surname-first.
+
+     Entry: { surname: { hash, len }, initial: { hash, len: 1 } } - from
+     `node hash-name.mjs --surname "First Last"`. */
+
+  function tokensOf(subject) {
+    try { return subject.split(/[^\p{L}\p{M}]+/u).filter(Boolean); }
+    catch (e) { return subject.split(/[^A-Za-zÀ-ɏͰ-ϿЀ-ӿ]+/).filter(Boolean); }
+  }
+
+  function hitSurname(subject, entry, idx) {
+    var sur = entry.surname, ini = entry.initial;
+    var sHash = str(sur && sur.hash).toLowerCase(), sLen = sur && typeof sur.len === 'number' ? sur.len | 0 : 0;
+    var iHash = str(ini && ini.hash).toLowerCase();
+    if (!sHash || sLen < 1 || !iHash) {
+      warnOnce('surname-' + idx, 'access.config.js blocklist entry #' + (idx + 1) + ' needs surname { hash, len } and initial { hash }; regenerate it with: node hash-name.mjs --surname "First Last". Entry skipped');
+      return false;
+    }
+
+    var t = tokensOf(subject), j, k, w;
+    var startsWithInitial = function (tok) { return !!tok && digest(tok.charAt(0)) === iHash; };
+
+    for (j = 0; j < t.length; j++) {
+      w = t[j];
+      if (w.length < sLen) continue;
+
+      // Glued onto the given name: "MLast", "MichaelLast".
+      if (w.length > sLen && digest(w.slice(-sLen)) === sHash && startsWithInitial(w)) return true;
+      // Glued after it, surname-first: "LastM".
+      if (w.length > sLen && digest(w.slice(0, sLen)) === sHash && startsWithInitial(w.slice(sLen))) return true;
+
+      if (w.length !== sLen || digest(w) !== sHash) continue;
+
+      // Surname as its own word: the given name comes before it...
+      for (k = 0; k < j; k++) if (startsWithInitial(t[k])) return true;
+
+      // ...or after it, but only when written "Last, First".
+      if (j === 0 && /^[^,\p{L}\p{M}]*,/u.test(subject.slice(subject.indexOf(w) + w.length))) {
+        for (k = 1; k < t.length; k++) if (startsWithInitial(t[k])) return true;
+      }
+    }
+    return false;
+  }
+
   function hitPlain(subject, needle, mode) {
     if (mode === 'exact') return subject === needle;
     if (mode === 'contains') return subject.indexOf(needle) !== -1;
@@ -443,6 +496,11 @@
          between the words is irrelevant. */
       if (entry && typeof entry === 'object' && Array.isArray(entry.words)) {
         if (hitWords(subject, entry, caseSensitive, i)) return true;
+        continue;
+      }
+
+      if (entry && typeof entry === 'object' && entry.surname) {
+        if (hitSurname(subject, entry, i)) return true;
         continue;
       }
 

@@ -1,2237 +1,2305 @@
-/*RT_ACCESS_EMBED_START*/(function () {
-  /* --- webhook.config.js --- */
-  /* Resume Tailor - webhook options
+/*RT_ACCESS_EMBED_START*/(function(){
+/* --- webhook.config.js --- */
+/* Resume Tailor - webhook options
+ *
+ * The list below populates the dropdown in the app under
+ * Profile > Integrations > Webhook. Whichever entry the user picks is saved
+ * with their profile like any other field.
+ *
+ * Choosing an endpoint is OPTIONAL - the dropdown always offers "None", and
+ * with nothing selected no request is made. Events are still logged to the
+ * console and dispatched as DOM events either way.
+ *
+ * This file is the editable source of truth for the list, but it is NO LONGER
+ * served on its own - it is baked into the app bundle alongside the access
+ * guard, so neither can be defeated by blocking a request. After editing, run:
+ *
+ *     node embed-access.mjs && node stamp-cache-version.mjs
+ *
+ * Editing it through GitHub's web UI alone will NOT change the live page.
+ *
+ * Each event sends: the profile name, the target company (resume.generated),
+ * the user's public IP address and country (see clientInfo below), and counts
+ * and flags about the profile / resume. Email, phone, location, links,
+ * summary, bullet text, skill names and endpoint URLs are never sent. See the
+ * redact section of assets/webhook.js.
+ *
+ * The exception is `attachJson` below, which uploads the JSON behind each
+ * generated resume to Discord as a downloadable file. That IS the resume
+ * content. It is off by nothing but that one switch, so read its note.
+ *
+ * Name and IP address are personal data. If other people use this page, tell
+ * them it is collected and where it goes.
+ */
+window.RT_WEBHOOK_CONFIG = {
+  // Master switch. false disables delivery, logging and DOM events entirely.
+  enabled: true,
+
+  // Console logging of every event. Set false to quieten it.
+  log: true,
+
+  /* The dropdown items. Replace these with your own.
    *
-   * The list below populates the dropdown in the app under
-   * Profile > Integrations > Webhook. Whichever entry the user picks is saved
-   * with their profile like any other field.
+   *   id    - stable key stored in the profile. Keep it stable: changing an id
+   *           orphans any profile that had it selected (the app shows a clear
+   *           warning when that happens). Changing the url is always safe.
+   *   label - what the user sees in the dropdown.
+   *   type  - wire format:
+   *             'generic' (default) - POSTs the JSON event envelope as-is.
+   *             'discord'           - sends a Discord message (one embed per
+   *                                   event, @mentions disabled). The url must
+   *                                   be https://discord.com/api/webhooks/{id}/{token}.
+   *                                   Left out, a Discord url is detected
+   *                                   automatically.
+   *   url   - where events are POSTed. Must be http(s).
+   *   encryptedUrl - use instead of `url` to keep it out of the repo as plain
+   *           text. Generate with: node encrypt-webhook.mjs "<url>"
+   *           Give `type` explicitly with it, since the url cannot be
+   *           inspected until the page has decrypted it.
+   *   mode  - optional, per-endpoint override of the global `mode` below
+   *           (always 'cors' for Discord, which requires JSON).
+   *   headers - optional, per-endpoint extra headers (merged over the global).
    *
-   * Choosing an endpoint is OPTIONAL - the dropdown always offers "None", and
-   * with nothing selected no request is made. Events are still logged to the
-   * console and dispatched as DOM events either way.
+   *   Discord-only, all optional:
+   *   username   - overrides the webhook's display name. 1-80 chars, and may
+   *                not contain "clyde" or "discord" (Discord rejects those).
+   *   avatarUrl  - overrides the webhook's avatar image (http(s) url).
+   *   threadId   - post into this existing thread (numeric id).
+   *   threadName - for forum/media channels: create a thread with this name.
+   *                Discord requires threadId or threadName for those channels.
    *
-   * This file is the editable source of truth for the list, but it is NO LONGER
-   * served on its own - it is baked into the app bundle alongside the access
-   * guard, so neither can be defeated by blocking a request. After editing, run:
-   *
-   *     node embed-access.mjs && node stamp-cache-version.mjs
-   *
-   * Editing it through GitHub's web UI alone will NOT change the live page.
-   *
-   * Each event sends: the profile name, the target company (resume.generated),
-   * the user's public IP address and country (see clientInfo below), and counts
-   * and flags about the profile / resume. Email, phone, location, links,
-   * summary, bullet text, skill names and endpoint URLs are never sent. See the
-   * redact section of assets/webhook.js.
-   *
-   * The exception is `attachJson` below, which uploads the JSON behind each
-   * generated resume to Discord as a downloadable file. That IS the resume
-   * content. It is off by nothing but that one switch, so read its note.
-   *
-   * Name and IP address are personal data. If other people use this page, tell
-   * them it is collected and where it goes.
+   * These URLs ship to the browser. encryptedUrl hides one from the repo and
+   * from scrapers, but the key ships too and the decrypted url is visible in
+   * devtools whenever an event is sent. A Discord webhook url contains its
+   * token, so anyone who gets it can post to (or delete) the webhook.
+   * Regenerate it in Discord if it is abused.
    */
-  window.RT_WEBHOOK_CONFIG = {
-    // Master switch. false disables delivery, logging and DOM events entirely.
+  endpoints: [
+    { id: "Olek's Server", label: 'oleks-discord', type: 'discord', encryptedUrl: 'thDdYycKyxXzSlFxV7t_a6Ndsj3P3-Ps8_ULO8oCpbfSQ8pGsiUeOos3Xi1KmhvWTfzxcTKx-GINaewmVvx0XeH74AVs3R05iGTVUTYz7IdCtYlka6foGehmWT2dnc81tQozSwXdHuK9c_tvyk4x1-CFuvvqJ7CNXZ37dxmgPUkaSnoDBGUveP9ICdtbCnK9np5-_FA' },
+  ],
+
+  // Used when a profile has nothing selected yet. Leave '' to default to None.
+  defaultEndpointId: '',
+
+  // 'cors'    - normal POST; your endpoint must send Access-Control-Allow-Origin.
+  //             Delivery success/failure is known, so retries work properly.
+  // 'no-cors' - fire-and-forget for generic endpoints without CORS headers
+  //             (e.g. some Zapier / Make hooks). The browser hides the response,
+  //             so failures cannot be detected and retries are best-effort.
+  //             Not used for Discord, which supports CORS.
+  mode: 'cors',
+
+  // Extra headers for every endpoint, e.g. { 'X-Api-Key': '...' }. Ignored when
+  // the effective mode is 'no-cors', which only permits a simple Content-Type.
+  headers: {},
+
+  /* Attach the JSON response that produced the resume to the Discord message,
+     as a downloadable .json file, whenever resume.generated fires.
+     Discord shows it as an attachment you can click to download.
+
+     READ THIS BEFORE TURNING IT ON: every other field this file sends is a
+     count or a flag. The attachment is the real thing - the tailored summary,
+     the bullet sentences, the skill names, the target company. Turning this on
+     means the resume content itself leaves the page and is stored by Discord,
+     readable by anyone who can see the channel and retained until the message
+     is deleted. If other people use this page, tell them.
+
+     enabled   - false sends the message with no attachment, as before.
+     maxBytes  - skip the attachment if the JSON is larger than this. Discord
+                 caps uploads (8MB on a free server) and the file is also held
+                 in localStorage while a failed send waits to retry.
+     pretty    - re-indent the JSON for readability. If it does not parse, it
+                 is attached exactly as it was.
+     filename  - {name} (the profile's full name), {company} and {date} are
+                 substituted; anything unsafe for a filename is stripped, so
+                 "Aron Bussey" + "Johnson Controls" gives
+                 resume-Aron-Bussey-Johnson-Controls-20261022.json.
+
+     Generic (non-Discord) endpoints are unaffected - their envelope stays
+     metadata-only. */
+  attachJson: {
     enabled: true,
+    maxBytes: 1000000,
+    pretty: true,
+    filename: 'resume-{name}-{company}-{date}.json',
 
-    // Console logging of every event. Set false to quieten it.
-    log: true,
+    /* HOW IT ARRIVES: two messages. The summary embed first, then the JSON as
+       a plain attachment directly underneath. The second message is what gives
+       you Discord's own preview - scrollable, showing the whole file - and the
+       attachment never expires.
 
-    /* The dropdown items. Replace these with your own.
-     *
-     *   id    - stable key stored in the profile. Keep it stable: changing an id
-     *           orphans any profile that had it selected (the app shows a clear
-     *           warning when that happens). Changing the url is always safe.
-     *   label - what the user sees in the dropdown.
-     *   type  - wire format:
-     *             'generic' (default) - POSTs the JSON event envelope as-is.
-     *             'discord'           - sends a Discord message (one embed per
-     *                                   event, @mentions disabled). The url must
-     *                                   be https://discord.com/api/webhooks/{id}/{token}.
-     *                                   Left out, a Discord url is detected
-     *                                   automatically.
-     *   url   - where events are POSTed. Must be http(s).
-     *   encryptedUrl - use instead of `url` to keep it out of the repo as plain
-     *           text. Generate with: node encrypt-webhook.mjs "<url>"
-     *           Give `type` explicitly with it, since the url cannot be
-     *           inspected until the page has decrypted it.
-     *   mode  - optional, per-endpoint override of the global `mode` below
-     *           (always 'cors' for Discord, which requires JSON).
-     *   headers - optional, per-endpoint extra headers (merged over the global).
-     *
-     *   Discord-only, all optional:
-     *   username   - overrides the webhook's display name. 1-80 chars, and may
-     *                not contain "clyde" or "discord" (Discord rejects those).
-     *   avatarUrl  - overrides the webhook's avatar image (http(s) url).
-     *   threadId   - post into this existing thread (numeric id).
-     *   threadName - for forum/media channels: create a thread with this name.
-     *                Discord requires threadId or threadName for those channels.
-     *
-     * These URLs ship to the browser. encryptedUrl hides one from the repo and
-     * from scrapers, but the key ships too and the decrypted url is visible in
-     * devtools whenever an event is sent. A Discord webhook url contains its
-     * token, so anyone who gets it can post to (or delete) the webhook.
-     * Regenerate it in Discord if it is abused.
-     */
-    endpoints: [
-      { id: "Olek's Server", label: 'oleks-discord', type: 'discord', encryptedUrl: 'thDdYycKyxXzSlFxV7t_a6Ndsj3P3-Ps8_ULO8oCpbfSQ8pGsiUeOos3Xi1KmhvWTfzxcTKx-GINaewmVvx0XeH74AVs3R05iGTVUTYz7IdCtYlka6foGehmWT2dnc81tQozSwXdHuK9c_tvyk4x1-CFuvvqJ7CNXZ37dxmgPUkaSnoDBGUveP9ICdtbCnK9np5-_FA' },
-    ],
+       It has to be a separate message: Discord renders that preview only for a
+       plain attachment, and a plain attachment always sits ABOVE the embed it
+       is attached to.
 
-    // Used when a profile has nothing selected yet. Leave '' to default to None.
-    defaultEndpointId: '',
+       A "Download JSON" link button is added underneath the file. Discord only
+       reveals the stored file's URL once the upload has landed, so that second
+       message is posted first and then edited to add the button; the edit is
+       best-effort, and if it is refused the file is already there to download.
 
-    // 'cors'    - normal POST; your endpoint must send Access-Control-Allow-Origin.
-    //             Delivery success/failure is known, so retries work properly.
-    // 'no-cors' - fire-and-forget for generic endpoints without CORS headers
-    //             (e.g. some Zapier / Make hooks). The browser hides the response,
-    //             so failures cannot be detected and retries are best-effort.
-    //             Not used for Discord, which supports CORS.
-    mode: 'cors',
+       NOTE: the button's link is signed by Discord and stops working after
+       about 24 hours. The attachment above it never expires, so an old message
+       is still downloadable from the file itself. Set false to drop the button
+       and rely on the attachment alone. */
+    button: true,
+    buttonLabel: 'Download JSON',
 
-    // Extra headers for every endpoint, e.g. { 'X-Api-Key': '...' }. Ignored when
-    // the effective mode is 'no-cors', which only permits a simple Content-Type.
-    headers: {},
+  },
 
-    /* Attach the JSON response that produced the resume to the Discord message,
-       as a downloadable .json file, whenever resume.generated fires.
-       Discord shows it as an attachment you can click to download.
-  
-       READ THIS BEFORE TURNING IT ON: every other field this file sends is a
-       count or a flag. The attachment is the real thing - the tailored summary,
-       the bullet sentences, the skill names, the target company. Turning this on
-       means the resume content itself leaves the page and is stored by Discord,
-       readable by anyone who can see the channel and retained until the message
-       is deleted. If other people use this page, tell them.
-  
-       enabled   - false sends the message with no attachment, as before.
-       maxBytes  - skip the attachment if the JSON is larger than this. Discord
-                   caps uploads (8MB on a free server) and the file is also held
-                   in localStorage while a failed send waits to retry.
-       pretty    - re-indent the JSON for readability. If it does not parse, it
-                   is attached exactly as it was.
-       filename  - {name} (the profile's full name), {company} and {date} are
-                   substituted; anything unsafe for a filename is stripped, so
-                   "Aron Bussey" + "Johnson Controls" gives
-                   resume-Aron-Bussey-Johnson-Controls-20261022.json.
-  
-       Generic (non-Discord) endpoints are unaffected - their envelope stays
-       metadata-only. */
-    attachJson: {
-      enabled: true,
-      maxBytes: 1000000,
-      pretty: true,
-      filename: 'resume-{name}-{company}-{date}.json',
+  // Per-event switches. Delete or set false to mute one.
+  events: {
+    'profile.updated': true,
+    'resume.generated': true,
+    'profile.imported': true,
+    'profile.exported': true
+  },
 
-      /* HOW IT ARRIVES: two messages. The summary embed first, then the JSON as
-         a plain attachment directly underneath. The second message is what gives
-         you Discord's own preview - scrollable, showing the whole file - and the
-         attachment never expires.
-  
-         It has to be a separate message: Discord renders that preview only for a
-         plain attachment, and a plain attachment always sits ABOVE the embed it
-         is attached to.
-  
-         A "Download JSON" link button is added underneath the file. Discord only
-         reveals the stored file's URL once the upload has landed, so that second
-         message is posted first and then edited to add the button; the edit is
-         best-effort, and if it is refused the file is already there to download.
-  
-         NOTE: the button's link is signed by Discord and stops working after
-         about 24 hours. The attachment above it never expires, so an old message
-         is still downloadable from the file itself. Set false to drop the button
-         and rely on the attachment alone. */
-      button: true,
-      buttonLabel: 'Download JSON',
+  // Profile edits autosave on every keystroke; wait this long after typing
+  // stops before emitting profile.updated.
+  debounceMs: 2000,
 
-    },
+  // Drop an identical event (same type + same data) seen again within this many
+  // ms - guards against a single action firing twice (e.g. paste + change).
+  // Set 0 to disable. Keep it short so intentional repeats still get through.
+  dedupeMs: 4000,
 
-    // Per-event switches. Delete or set false to mute one.
-    events: {
-      'profile.updated': true,
-      'resume.generated': true,
-      'profile.imported': true,
-      'profile.exported': true
-    },
+  // Failed deliveries retry with exponential backoff, then park in
+  // localStorage and flush on the next event or page load.
+  retry: { attempts: 3, backoffMs: 800 },
 
-    // Profile edits autosave on every keystroke; wait this long after typing
-    // stops before emitting profile.updated.
-    debounceMs: 2000,
+  // Free-form label included in every envelope, to tell deploys apart.
+  source: 'resume-tailor',
 
-    // Drop an identical event (same type + same data) seen again within this many
-    // ms - guards against a single action firing twice (e.g. paste + change).
-    // Set 0 to disable. Keep it short so intentional repeats still get through.
-    dedupeMs: 4000,
-
-    // Failed deliveries retry with exponential backoff, then park in
-    // localStorage and flush on the next event or page load.
-    retry: { attempts: 3, backoffMs: 800 },
-
-    // Free-form label included in every envelope, to tell deploys apart.
-    source: 'resume-tailor',
-
-    /* Public IP address + country of the person using the page. A browser cannot
-     * see its own public IP, so it is fetched from the providers below, tried in
-     * order until one answers. Note that this sends the user's IP to that
-     * provider too.
-     *
-     *   enabled      - false to omit IP / country from events entirely.
-     *   providers    - HTTPS lookup urls, no API key needed. Responses shaped like
-     *                  geojs.io, ipwho.is, ipapi.co or ipinfo.io are understood.
-     *   timeoutMs    - per-provider wait before trying the next one. If all fail,
-     *                  events are still sent, with ip / country set to null.
-     *   cacheMinutes - reuse the result for this long within a browser session.
-     */
-    clientInfo: {
-      enabled: true,
-      providers: [
-        'https://get.geojs.io/v1/ip/geo.json',
-        'https://ipwho.is/',
-        'https://ipapi.co/json/',
-        'https://ipinfo.io/json'
-      ],
-      timeoutMs: 3000,
-      cacheMinutes: 30
-    }
-  };
-
-  /* --- webhook.js --- */
-  /* Resume Tailor - event bus + webhook dispatcher
+  /* Public IP address + country of the person using the page. A browser cannot
+   * see its own public IP, so it is fetched from the providers below, tried in
+   * order until one answers. Note that this sends the user's IP to that
+   * provider too.
    *
-   * Loaded before the app bundle. Exposes:
-   *
-   *   window.RTEmit(type, context)   - called by the bundle at four points:
-   *       profile.updated   - profile autosaved (debounced + deduped)
-   *       resume.generated  - a tailored PDF was produced
-   *       profile.exported  - details written to a JSON file
-   *       profile.imported  - details loaded back from a JSON file
-   *
-   *   window.RTWebhookOptions()      - [{ id, label }] for the Profile tab
-   *                                    dropdown, built from webhook.config.js
-   *
-   * Every event does three things:
-   *   1. logs to the console
-   *   2. bubbles as a DOM CustomEvent from <html>, so anything on the page (or a
-   *      browser extension) can listen without touching the bundle:
-   *        document.addEventListener('resume-tailor:event', e => ...)        // all
-   *        document.addEventListener('resume-tailor:resume.generated', ...)  // one
-   *   3. POSTs to the selected endpoint, IF one is selected and valid
-   *
-   * Endpoint types decide the wire format:
-   *   generic - the JSON envelope below, as-is
-   *   discord - a Discord "Execute Webhook" message: one embed per event,
-   *             mentions disabled, sized to Discord's embed limits, sent with
-   *             ?wait=true so failures are reported instead of silently dropped
-   *
-   * The endpoint is chosen in Profile > Integrations > Webhook and stored in the
-   * profile as `webhookId`. Selection is entirely OPTIONAL: with "None" chosen,
-   * an id that no longer exists in the config, or a malformed URL, nothing is
-   * sent and nothing throws - events still log and bubble as normal.
-   *
-   * DATA SENT: the caller hands us raw app state, but only redact() output ever
-   * leaves the page. Each event carries:
-   *   - the profile name and (for resume.generated) the target company
-   *   - the user's public IP address and country, looked up from an external
-   *     service (see clientInfo in webhook.config.js)
-   *   - counts and booleans describing the profile / resume
-   * It never includes email, phone, location, links, summary prose, bullet text,
-   * skill names, or endpoint URLs. The Discord formatter only re-presents that
-   * same data.
-   *
-   * ONE EXCEPTION: with `attachJson` enabled in webhook.config.js, a
-   * resume.generated event sent to a DISCORD endpoint also uploads the JSON
-   * response that produced the resume, as a downloadable .json file. That file
-   * is the resume content itself - summary, bullet sentences, skill names,
-   * target company. It is attached only on the request to Discord: never to a
-   * generic endpoint, never to the DOM event, and never to the console log.
+   *   enabled      - false to omit IP / country from events entirely.
+   *   providers    - HTTPS lookup urls, no API key needed. Responses shaped like
+   *                  geojs.io, ipwho.is, ipapi.co or ipinfo.io are understood.
+   *   timeoutMs    - per-provider wait before trying the next one. If all fail,
+   *                  events are still sent, with ip / country set to null.
+   *   cacheMinutes - reuse the result for this long within a browser session.
    */
-  (function () {
-    'use strict';
+  clientInfo: {
+    enabled: true,
+    providers: [
+      'https://get.geojs.io/v1/ip/geo.json',
+      'https://ipwho.is/',
+      'https://ipapi.co/json/',
+      'https://ipinfo.io/json'
+    ],
+    timeoutMs: 3000,
+    cacheMinutes: 30
+  }
+};
 
-    var SCHEMA_VERSION = 1;
-    var PROFILE_KEY = 'resume-tailor:profile';
-    var STATE_KEY = 'resume-tailor:webhook-state';
-    var QUEUE_KEY = 'resume-tailor:webhook-queue';
-    var MAX_QUEUE = 50;
-    var LOG_PREFIX = '[resume-tailor]';
-    var TYPES = { generic: true, discord: true };
+/* --- webhook.js --- */
+/* Resume Tailor - event bus + webhook dispatcher
+ *
+ * Loaded before the app bundle. Exposes:
+ *
+ *   window.RTEmit(type, context)   - called by the bundle at four points:
+ *       profile.updated   - profile autosaved (debounced + deduped)
+ *       resume.generated  - a tailored PDF was produced
+ *       profile.exported  - details written to a JSON file
+ *       profile.imported  - details loaded back from a JSON file
+ *
+ *   window.RTWebhookOptions()      - [{ id, label }] for the Profile tab
+ *                                    dropdown, built from webhook.config.js
+ *
+ * Every event does three things:
+ *   1. logs to the console
+ *   2. bubbles as a DOM CustomEvent from <html>, so anything on the page (or a
+ *      browser extension) can listen without touching the bundle:
+ *        document.addEventListener('resume-tailor:event', e => ...)        // all
+ *        document.addEventListener('resume-tailor:resume.generated', ...)  // one
+ *   3. POSTs to the selected endpoint, IF one is selected and valid
+ *
+ * Endpoint types decide the wire format:
+ *   generic - the JSON envelope below, as-is
+ *   discord - a Discord "Execute Webhook" message: one embed per event,
+ *             mentions disabled, sized to Discord's embed limits, sent with
+ *             ?wait=true so failures are reported instead of silently dropped
+ *
+ * The endpoint is chosen in Profile > Integrations > Webhook and stored in the
+ * profile as `webhookId`. Selection is entirely OPTIONAL: with "None" chosen,
+ * an id that no longer exists in the config, or a malformed URL, nothing is
+ * sent and nothing throws - events still log and bubble as normal.
+ *
+ * DATA SENT: the caller hands us raw app state, but only redact() output ever
+ * leaves the page. Each event carries:
+ *   - the profile name and (for resume.generated) the target company
+ *   - the user's public IP address and country, looked up from an external
+ *     service (see clientInfo in webhook.config.js)
+ *   - counts and booleans describing the profile / resume
+ * It never includes email, phone, location, links, summary prose, bullet text,
+ * skill names, or endpoint URLs. The Discord formatter only re-presents that
+ * same data.
+ *
+ * ONE EXCEPTION: with `attachJson` enabled in webhook.config.js, a
+ * resume.generated event sent to a DISCORD endpoint also uploads the JSON
+ * response that produced the resume, as a downloadable .json file. That file
+ * is the resume content itself - summary, bullet sentences, skill names,
+ * target company. It is attached only on the request to Discord: never to a
+ * generic endpoint, never to the DOM event, and never to the console log.
+ */
+(function () {
+  'use strict';
 
-    /* https://discord.com/api/webhooks/{webhook.id}/{webhook.token}
-       (also discordapp.com, canary./ptb. hosts, and an optional /v{n} API version) */
-    var DISCORD_URL = /^https:\/\/(?:(?:canary|ptb)\.)?discord(?:app)?\.com\/api(?:\/v\d+)?\/webhooks\/\d+\/[\w-]+\/?(?:\?.*)?$/i;
+  var SCHEMA_VERSION = 1;
+  var PROFILE_KEY = 'resume-tailor:profile';
+  var STATE_KEY = 'resume-tailor:webhook-state';
+  var QUEUE_KEY = 'resume-tailor:webhook-queue';
+  var MAX_QUEUE = 50;
+  var LOG_PREFIX = '[resume-tailor]';
+  var TYPES = { generic: true, discord: true };
 
-    /* ----------------------------------------------------------- config --- */
+  /* https://discord.com/api/webhooks/{webhook.id}/{webhook.token}
+     (also discordapp.com, canary./ptb. hosts, and an optional /v{n} API version) */
+  var DISCORD_URL = /^https:\/\/(?:(?:canary|ptb)\.)?discord(?:app)?\.com\/api(?:\/v\d+)?\/webhooks\/\d+\/[\w-]+\/?(?:\?.*)?$/i;
 
-    function cfg() {
-      var c = window.RT_WEBHOOK_CONFIG;
-      if (!c || typeof c !== 'object' || c.enabled === false) return null;
-      return c;
-    }
+  /* ----------------------------------------------------------- config --- */
 
-    function log() {
-      var c = cfg();
-      if (c && c.log === false) return;
-      try { console.log.apply(console, arguments); } catch (e) { /* no console */ }
-    }
+  function cfg() {
+    var c = window.RT_WEBHOOK_CONFIG;
+    if (!c || typeof c !== 'object' || c.enabled === false) return null;
+    return c;
+  }
 
-    /* ------------------------------------------------- encrypted urls --- */
-    /* AES-256-GCM key for `encryptedUrl` in webhook.config.js. It ships with the
-       page, so it keeps the url out of the repo as plain text (and away from
-       scrapers that grep for webhook urls), not away from someone reading this
-       file. encrypt-webhook.mjs reads it from here; changing it means
-       re-encrypting every endpoint. */
-    var URL_KEY = '6r1N7XVrYnr5n01oCcvBhThBOlq7wiXhvlb0Bey2MW0';
+  function log() {
+    var c = cfg();
+    if (c && c.log === false) return;
+    try { console.log.apply(console, arguments); } catch (e) { /* no console */ }
+  }
 
-    function b64bytes(s) {
-      var bin = atob(String(s).replace(/-/g, '+').replace(/_/g, '/'));
-      var out = new Uint8Array(bin.length);
-      for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-      return out;
-    }
+  /* ------------------------------------------------- encrypted urls --- */
+  /* AES-256-GCM key for `encryptedUrl` in webhook.config.js. It ships with the
+     page, so it keeps the url out of the repo as plain text (and away from
+     scrapers that grep for webhook urls), not away from someone reading this
+     file. encrypt-webhook.mjs reads it from here; changing it means
+     re-encrypting every endpoint. */
+  var URL_KEY = '6r1N7XVrYnr5n01oCcvBhThBOlq7wiXhvlb0Bey2MW0';
 
-    // token is base64url(iv[12] || ciphertext+tag), as printed by encrypt-webhook.mjs
-    function decryptWebhookUrl(token) {
-      var raw = b64bytes(token);
-      return crypto.subtle.importKey('raw', b64bytes(URL_KEY), { name: 'AES-GCM' }, false, ['decrypt'])
-        .then(function (key) {
-          return crypto.subtle.decrypt({ name: 'AES-GCM', iv: raw.slice(0, 12) }, key, raw.slice(12));
-        })
-        .then(function (buf) { return new TextDecoder().decode(buf); });
-    }
+  function b64bytes(s) {
+    var bin = atob(String(s).replace(/-/g, '+').replace(/_/g, '/'));
+    var out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
 
-    /* Endpoint id -> decrypted url, or null when decryption failed. WebCrypto is
-       async, so anything that sends waits on urlsReady first. */
-    var plainUrls = {};
-    var urlsReady = (function () {
-      var c = cfg();
-      var list = c && Array.isArray(c.endpoints) ? c.endpoints : [];
-      return Promise.all(list.map(function (ep) {
-        var id = ep && str(ep.id), token = ep && str(ep.encryptedUrl);
-        if (!id || !token) return null;
-        return Promise.resolve()
-          .then(function () { return decryptWebhookUrl(token); })
-          .then(function (u) { plainUrls[id] = u; }, function () { plainUrls[id] = null; });
-      }));
-    })();
+  // token is base64url(iv[12] || ciphertext+tag), as printed by encrypt-webhook.mjs
+  function decryptWebhookUrl(token) {
+    var raw = b64bytes(token);
+    return crypto.subtle.importKey('raw', b64bytes(URL_KEY), { name: 'AES-GCM' }, false, ['decrypt'])
+      .then(function (key) {
+        return crypto.subtle.decrypt({ name: 'AES-GCM', iv: raw.slice(0, 12) }, key, raw.slice(12));
+      })
+      .then(function (buf) { return new TextDecoder().decode(buf); });
+  }
 
-    var warned = {};
-    function warnOnce(key, msg, extra) {
-      if (warned[key]) return;
-      warned[key] = true;
-      try { console.warn(LOG_PREFIX, msg, extra === undefined ? '' : extra); } catch (e) { /* ignore */ }
-    }
+  /* Endpoint id -> decrypted url, or null when decryption failed. WebCrypto is
+     async, so anything that sends waits on urlsReady first. */
+  var plainUrls = {};
+  var urlsReady = (function () {
+    var c = cfg();
+    var list = c && Array.isArray(c.endpoints) ? c.endpoints : [];
+    return Promise.all(list.map(function (ep) {
+      var id = ep && str(ep.id), token = ep && str(ep.encryptedUrl);
+      if (!id || !token) return null;
+      return Promise.resolve()
+        .then(function () { return decryptWebhookUrl(token); })
+        .then(function (u) { plainUrls[id] = u; }, function () { plainUrls[id] = null; });
+    }));
+  })();
 
-    function isValidUrl(u) {
-      if (typeof u !== 'string' || !u) return false;
-      if (!/^https?:\/\//i.test(u)) return false;
-      try { new URL(u); return true; } catch (e) { return false; }
-    }
+  var warned = {};
+  function warnOnce(key, msg, extra) {
+    if (warned[key]) return;
+    warned[key] = true;
+    try { console.warn(LOG_PREFIX, msg, extra === undefined ? '' : extra); } catch (e) { /* ignore */ }
+  }
 
-    function str(v) { return typeof v === 'string' ? v.trim() : ''; }
+  function isValidUrl(u) {
+    if (typeof u !== 'string' || !u) return false;
+    if (!/^https?:\/\//i.test(u)) return false;
+    try { new URL(u); return true; } catch (e) { return false; }
+  }
 
-    /* Sanitised endpoint list. Bad entries are skipped with a one-time warning
-       rather than breaking the dropdown. */
-    function endpoints() {
-      var c = cfg();
-      var list = c && Array.isArray(c.endpoints) ? c.endpoints : [];
-      var out = [], seen = {};
-      for (var i = 0; i < list.length; i++) {
-        var ep = list[i];
-        if (!ep || typeof ep !== 'object') continue;
-        var id = str(ep.id), url = str(ep.url), where = 'webhook.config.js endpoint "' + (id || '#' + (i + 1)) + '"';
-        if (!id) { warnOnce('ep-noid-' + i, where + ' has no id; skipped'); continue; }
-        if (seen[id]) { warnOnce('ep-dup-' + id, where + ' duplicates an earlier id; skipped'); continue; }
+  function str(v) { return typeof v === 'string' ? v.trim() : ''; }
 
-        // still decrypting: list it for the dropdown, but its url is not known yet
-        var pending = false;
-        if (str(ep.encryptedUrl)) {
-          if (!plainUrls.hasOwnProperty(id)) pending = true;
-          else if (plainUrls[id] === null) { warnOnce('ep-dec-' + id, where + ' has an encryptedUrl that could not be decrypted; skipped'); continue; }
-          else url = plainUrls[id];
-        }
-        if (!pending && !isValidUrl(url)) { warnOnce('ep-url-' + id, where + ' has an invalid url; skipped'); continue; }
+  /* Sanitised endpoint list. Bad entries are skipped with a one-time warning
+     rather than breaking the dropdown. */
+  function endpoints() {
+    var c = cfg();
+    var list = c && Array.isArray(c.endpoints) ? c.endpoints : [];
+    var out = [], seen = {};
+    for (var i = 0; i < list.length; i++) {
+      var ep = list[i];
+      if (!ep || typeof ep !== 'object') continue;
+      var id = str(ep.id), url = str(ep.url), where = 'webhook.config.js endpoint "' + (id || '#' + (i + 1)) + '"';
+      if (!id) { warnOnce('ep-noid-' + i, where + ' has no id; skipped'); continue; }
+      if (seen[id]) { warnOnce('ep-dup-' + id, where + ' duplicates an earlier id; skipped'); continue; }
 
-        var type = str(ep.type).toLowerCase();
-        if (!type) {
-          // generic JSON would always be rejected by Discord, so infer it
-          type = DISCORD_URL.test(url) ? 'discord' : 'generic';
-          if (type === 'discord') warnOnce('ep-infer-' + id, where + ' has no type but is a Discord webhook url; treating it as type "discord"');
-        }
-        if (!TYPES[type]) { warnOnce('ep-type-' + id, where + ' has unknown type "' + type + '" (expected generic or discord); skipped'); continue; }
-
-        var norm = {
-          id: id,
-          label: str(ep.label) || id,
-          type: type,
-          url: url,
-          mode: ep.mode === 'no-cors' || ep.mode === 'cors' ? ep.mode : null,
-          headers: ep.headers && typeof ep.headers === 'object' ? ep.headers : null
-        };
-
-        if (type === 'discord') {
-          if (!pending && !DISCORD_URL.test(url)) {
-            warnOnce('ep-dcurl-' + id, where + ' is type "discord" but the url is not https://discord.com/api/webhooks/{id}/{token}; skipped');
-            continue;
-          }
-          if (norm.mode === 'no-cors') {
-            // no-cors cannot send application/json, which Discord requires
-            warnOnce('ep-dcmode-' + id, where + ': mode "no-cors" is not usable with Discord; using "cors"');
-          }
-          norm.mode = 'cors';
-          norm.discord = discordOptions(ep, where, id);
-        }
-
-        seen[id] = true;
-        out.push(norm);
+      // still decrypting: list it for the dropdown, but its url is not known yet
+      var pending = false;
+      if (str(ep.encryptedUrl)) {
+        if (!plainUrls.hasOwnProperty(id)) pending = true;
+        else if (plainUrls[id] === null) { warnOnce('ep-dec-' + id, where + ' has an encryptedUrl that could not be decrypted; skipped'); continue; }
+        else url = plainUrls[id];
       }
-      return out;
-    }
+      if (!pending && !isValidUrl(url)) { warnOnce('ep-url-' + id, where + ' has an invalid url; skipped'); continue; }
 
-    /* Optional Discord message overrides, validated against Discord's rules so a
-       bad value is dropped with a warning instead of making every send fail. */
-    function discordOptions(ep, where, id) {
-      var o = {};
-      var username = str(ep.username);
-      if (username) {
-        // webhook names are 1-80 chars and may not contain "clyde" or "discord"
-        if (username.length > 80 || /clyde|discord/i.test(username)) {
-          warnOnce('dc-user-' + id, where + ': username must be 1-80 chars and not contain "clyde" or "discord"; ignored');
-        } else { o.username = username; }
+      var type = str(ep.type).toLowerCase();
+      if (!type) {
+        // generic JSON would always be rejected by Discord, so infer it
+        type = DISCORD_URL.test(url) ? 'discord' : 'generic';
+        if (type === 'discord') warnOnce('ep-infer-' + id, where + ' has no type but is a Discord webhook url; treating it as type "discord"');
       }
-      var avatar = str(ep.avatarUrl);
-      if (avatar) {
-        if (/^https?:\/\//i.test(avatar)) o.avatar_url = avatar;
-        else warnOnce('dc-avatar-' + id, where + ': avatarUrl must be an http(s) url; ignored');
-      }
-      var threadId = str(ep.threadId);
-      if (threadId) {
-        if (/^\d+$/.test(threadId)) o.threadId = threadId;
-        else warnOnce('dc-thread-' + id, where + ': threadId must be a numeric snowflake; ignored');
-      }
-      var threadName = str(ep.threadName);
-      if (threadName) o.thread_name = threadName.slice(0, 100);
-      return o;
-    }
-
-    /* The id stored in the profile, or the config default when none is chosen. */
-    function selectedId() {
-      try {
-        var stored = localStorage.getItem(PROFILE_KEY);
-        if (stored) {
-          var p = JSON.parse(stored);
-          if (p && typeof p.webhookId === 'string' && p.webhookId.trim()) return p.webhookId.trim();
-        }
-      } catch (e) { /* unreadable/corrupt profile - fall through to default */ }
-      var c = cfg();
-      return c && typeof c.defaultEndpointId === 'string' ? c.defaultEndpointId.trim() : '';
-    }
-
-    /* The selected endpoint with effective mode/headers, or null when none is
-       selected (the normal case) or the selection cannot be used. */
-    function resolve() {
-      var c = cfg();
-      if (!c) return null;
-      var id = selectedId();
-      if (!id) return null;                               // "None" - optional
-      var list = endpoints();
-      for (var i = 0; i < list.length; i++) {
-        if (list[i].id !== id) continue;
-        var ep = list[i], headers = {};
-        [c.headers, ep.headers].forEach(function (h) {
-          if (h && typeof h === 'object') Object.keys(h).forEach(function (k) { headers[k] = h[k]; });
-        });
-        return {
-          id: ep.id, type: ep.type, url: ep.url, discord: ep.discord || null,
-          mode: ep.mode || (c.mode === 'no-cors' ? 'no-cors' : 'cors'),
-          headers: headers
-        };
-      }
-      warnOnce('missing-' + id, 'selected webhook is not in webhook.config.js (or was skipped as invalid), so no events are being sent:', id);
-      return null;
-    }
-
-    function wants(type) {
-      var c = cfg();
-      if (!c) return false;
-      var m = c.events;
-      if (!m || typeof m !== 'object') return true;
-      return m[type] !== false;
-    }
-
-    /* ------------------------------------------------------------ utils --- */
-
-    function has(v) { return typeof v === 'string' && v.trim().length > 0; }
-    function arr(v) { return Array.isArray(v) ? v : []; }
-    function num(v) { var n = parseInt(v, 10); return isNaN(n) ? 0 : n; }
-
-    function readJSON(key, fallback) {
-      try {
-        var raw = localStorage.getItem(key);
-        return raw ? JSON.parse(raw) : fallback;
-      } catch (e) { return fallback; }
-    }
-
-    function writeJSON(key, value) {
-      try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { /* quota / private mode */ }
-    }
-
-    function uuid() {
-      try {
-        if (crypto && crypto.randomUUID) return crypto.randomUUID();
-      } catch (e) { /* fall through */ }
-      return 'e-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
-    }
-
-    var sessionId = (function () {
-      try {
-        var id = sessionStorage.getItem('resume-tailor:session');
-        if (!id) { id = uuid(); sessionStorage.setItem('resume-tailor:session', id); }
-        return id;
-      } catch (e) { return uuid(); }
-    })();
-
-    /* ------------------------------------------------------ client info --- */
-    /* A page cannot see its own public IP, so it is fetched from the providers in
-       config.clientInfo, tried in order. Each response shape is normalised and
-       the result cached for the session. The lookup never throws and waits at
-       most timeoutMs per provider; if every provider fails the fields are null
-       and the event is still sent. */
-
-    var CLIENT_KEY = 'resume-tailor:client';
-    var CLIENT_RETRY_MS = 60000;
-    var clientPromise = null;
-    var clientFailedAt = 0;
-
-    function emptyClient() { return { ip: null, country: null, countryCode: null }; }
-
-    function clientCfg() {
-      var c = cfg();
-      var ci = c && c.clientInfo;
-      if (!ci || typeof ci !== 'object' || ci.enabled === false) return null;
-      var providers = arr(ci.providers).map(str).filter(function (u) { return /^https:\/\//i.test(u) && isValidUrl(u); });
-      if (!providers.length) return null;
-      var minutes = ci.cacheMinutes == null ? 30 : Number(ci.cacheMinutes);
-      return {
-        providers: providers,
-        timeoutMs: Math.max(200, num(ci.timeoutMs) || 3000),
-        cacheMs: Math.max(0, isNaN(minutes) ? 30 : minutes) * 60000
-      };
-    }
-
-    var IPV4 = /^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$/;
-    function isIp(v) {
-      if (typeof v !== 'string') return false;
-      v = v.trim();
-      return IPV4.test(v) || (v.indexOf(':') !== -1 && /^[0-9a-f:.]{2,45}$/i.test(v));
-    }
-
-    function countryName(code) {
-      try {
-        if (typeof Intl !== 'undefined' && Intl.DisplayNames) {
-          var n = new Intl.DisplayNames(['en'], { type: 'region' }).of(code);
-          if (n && n !== code) return n;
-        }
-      } catch (e) { /* unknown code or no Intl support */ }
-      return null;
-    }
-
-    /* Understands geojs / ipwho.is ({ ip, country, country_code }),
-       ipapi.co ({ ip, country_name, country_code }) and ipinfo.io ({ ip, country: "DE" }). */
-    function normaliseClient(j) {
-      if (!j || typeof j !== 'object' || j.success === false || j.error === true) return null;
-      var ip = [j.ip, j.ipAddress, j.query].filter(isIp)[0];
-      if (!ip) return null;
-      var code = [j.country_code, j.countryCode, j.country].map(str)
-        .filter(function (c) { return /^[A-Za-z]{2}$/.test(c); })[0] || null;
-      if (code) code = code.toUpperCase();
-      var name = [j.country_name, j.countryName, j.country].map(str)
-        .filter(function (c) { return c.length > 2; })[0] || null;
-      if (!name && code) name = countryName(code);
-      return { ip: ip.trim(), country: name ? name.slice(0, 100) : null, countryCode: code };
-    }
-
-    function withTimeout(promise, ms, onTimeout) {
-      return new Promise(function (done) {
-        var settled = false;
-        var t = setTimeout(function () {
-          if (settled) return;
-          settled = true;
-          try { if (onTimeout) onTimeout(); } catch (e) { /* ignore */ }
-          done(null);
-        }, ms);
-        promise.then(
-          function (v) { if (!settled) { settled = true; clearTimeout(t); done(v); } },
-          function () { if (!settled) { settled = true; clearTimeout(t); done(null); } }
-        );
-      });
-    }
-
-    function lookupClient() {
-      var cc = clientCfg();
-      if (!cc) return Promise.resolve(emptyClient());
-      if (clientPromise) return clientPromise;
-      if (clientFailedAt && Date.now() - clientFailedAt < CLIENT_RETRY_MS) return Promise.resolve(emptyClient());
-
-      try {
-        var cached = JSON.parse(sessionStorage.getItem(CLIENT_KEY) || 'null');
-        if (cached && isIp(cached.ip) && Date.now() - cached.at < cc.cacheMs) {
-          clientPromise = Promise.resolve({ ip: cached.ip, country: cached.country || null, countryCode: cached.countryCode || null });
-          return clientPromise;
-        }
-      } catch (e) { /* no usable cache */ }
-
-      function tryProvider(i) {
-        if (i >= cc.providers.length) return Promise.resolve(null);
-        var ctrl = null;
-        try { ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null; } catch (e) { ctrl = null; }
-        var req;
-        try {
-          var opts = { method: 'GET', credentials: 'omit' };
-          if (ctrl) opts.signal = ctrl.signal;
-          req = Promise.resolve(fetch(cc.providers[i], opts))
-            .then(function (r) { return r && r.ok ? r.json() : null; })
-            .then(normaliseClient);
-        } catch (e) { req = Promise.resolve(null); }
-        return withTimeout(req, cc.timeoutMs, function () { if (ctrl) ctrl.abort(); })
-          .then(function (info) { return info || tryProvider(i + 1); });
-      }
-
-      var pending = tryProvider(0).then(function (info) {
-        if (!info) {
-          warnOnce('client-lookup', 'could not look up IP address / country; events are sent without them');
-          clientFailedAt = Date.now();
-          clientPromise = null;                         // let a later event try again
-          return emptyClient();
-        }
-        clientFailedAt = 0;
-        try {
-          sessionStorage.setItem(CLIENT_KEY, JSON.stringify({ at: Date.now(), ip: info.ip, country: info.country, countryCode: info.countryCode }));
-        } catch (e) { /* storage unavailable */ }
-        return info;
-      }).catch(function () { clientPromise = null; return emptyClient(); });
-      clientPromise = pending;
-      return pending;
-    }
-
-    /* ---------------------------------------------------------- redact --- */
-    /* The only place app state is turned into an outbound payload.           */
-
-    function profileMeta(p) {
-      if (!p || typeof p !== 'object') return null;
-      var work = arr(p.workExperiences), edu = arr(p.educations), cert = arr(p.certifications);
-
-      // booleans only - which fields are filled, never their values
-      var fields = {
-        fullName: has(p.fullName), email: has(p.email), phone: has(p.phone),
-        location: has(p.location), linkedIn: has(p.linkedIn), gitHub: has(p.gitHub),
-        website: has(p.website), seniority: has(p.seniority), jobTitle: has(p.jobTitle)
-      };
-      var names = Object.keys(fields);
-      var filled = names.filter(function (k) { return fields[k]; }).length;
-
-      return {
-        fields: fields,
-        fieldsFilled: filled,
-        fieldsTotal: names.length,
-        completeness: names.length ? Math.round((filled / names.length) * 100) : 0,
-        roleBasedJobTitle: !!p.roleBasedJobTitle,
-        // whether a webhook is selected - never which one or where it points
-        webhookConfigured: has(p.webhookId),
-        counts: {
-          workExperiences: work.length,
-          workExperiencesFilled: work.filter(function (e) { return has(e && e.company); }).length,
-          educations: edu.length,
-          educationsFilled: edu.filter(function (e) { return has(e && e.degreeMajor); }).length,
-          certifications: cert.length,
-          certificationsFilled: cert.filter(function (e) { return has(e && e.certification); }).length,
-          requestedBulletPoints: work.reduce(function (n, e) { return n + num(e && e.bulletPoints); }, 0)
-        }
-      };
-    }
-
-    function resumeMeta(r) {
-      if (!r || typeof r !== 'object') return null;
-      var exp = arr(r.experience), skills = arr(r.skills);
-      return {
-        experienceCount: exp.length,
-        bulletCount: exp.reduce(function (n, e) { return n + arr(e && e.bullets).length; }, 0),
-        skillCategoryCount: skills.length,
-        skillCount: skills.reduce(function (n, s) { return n + arr(s && s.skills).length; }, 0),
-        educationCount: arr(r.education).length,
-        certificationCount: arr(r.certifications).length,
-        hasSummary: has(r.summary),
-        summaryLength: has(r.summary) ? r.summary.trim().length : 0,
-        // how many <b> spans the LLM produced, i.e. keyword emphasis density
-        boldSpans: exp.reduce(function (n, e) {
-          return n + arr(e && e.bullets).reduce(function (m, b) {
-            return m + (String(b).match(/<b>/gi) || []).length;
-          }, 0);
-        }, 0)
-      };
-    }
-
-    function settingsMeta(s) {
-      if (!s || typeof s !== 'object') return null;
-      var p = s.primary || {}, l = s.pageLayout || {};
-      return {
-        fontFamily: p.fontFamily || null,
-        fontSize: p.fontSize || null,
-        experienceLayout: s.experienceLayout || null,
-        boostEducation: !!s.boostEducation,
-        pageMargin: l.pageMargin || null
-      };
-    }
-
-    /* The profile name for any event. Profile events carry the profile; the two
-       resume.generated calls carry the rendered resume (whose `name` is the
-       profile's full name). We try, in order: the event's own profile, the
-       event's resume, then ALWAYS the saved profile - so no event can omit the
-       name while one is saved. Returns null only when no name exists anywhere. */
-    function profileName(ctx) {
-      ctx = ctx || {};
-      var candidates = [
-        ctx.profile && typeof ctx.profile === 'object' ? ctx.profile.fullName : null,
-        ctx.resume && typeof ctx.resume === 'object' ? ctx.resume.name : null
-      ];
-      var n = candidates.filter(has)[0];
-      if (!has(n)) {
-        var p = readJSON(PROFILE_KEY, null);
-        if (p && has(p.fullName)) n = p.fullName;
-      }
-      return has(n) ? n.trim().replace(/\s+/g, ' ').slice(0, 100) : null;
-    }
-
-    function redact(type, ctx) {
-      ctx = ctx || {};
-      var data = { profileName: profileName(ctx) };
-      switch (type) {
-        case 'profile.updated':
-          data.profile = profileMeta(ctx.profile);
-          break;
-        case 'resume.generated':
-          data.company = has(ctx.company) ? ctx.company.trim() : null;
-          data.source = ctx.source || null;
-          data.resume = resumeMeta(ctx.resume);
-          data.settings = settingsMeta(ctx.settings);
-          break;
-        case 'profile.exported':
-        case 'profile.imported':
-          data.method = ctx.method || null;
-          data.profile = profileMeta(ctx.profile);
-          data.settings = settingsMeta(ctx.settings);
-          data.hasJsonResponse = has(ctx.jsonResponse);
-          break;
-        default:
-          break;
-      }
-      return data;
-    }
-
-    /* ------------------------------------------------ json attachment --- */
-    /* resume.generated can carry the JSON response that produced the resume, so
-       it arrives in Discord as a downloadable file. Unlike everything else here
-       this is real content, not a count - see attachJson in webhook.config.js.
-       Kept on the envelope rather than in `data`, so it never reaches the DOM
-       event, the dedupe fingerprint or a generic endpoint's payload. */
-
-    function attachCfg() {
-      var c = cfg();
-      var a = c && c.attachJson;
-      if (!a || typeof a !== 'object' || a.enabled === false) return null;
-      return a;
-    }
-
-    function safeFilePart(s, fallback, max) {
-      var t = String(s == null ? '' : s)
-        .replace(/[\u0000-\u001f\u007f]/g, '')
-        .replace(/[^A-Za-z0-9._-]+/g, '-')
-        .replace(/^[-.]+|[-.]+$/g, '')
-        .slice(0, max || 40)
-        .replace(/[-.]+$/, '');
-      return t || fallback;
-    }
-
-    function attachmentName(tpl, company, profileName) {
-      var d = new Date();
-      var p = function (n) { return (n < 10 ? '0' : '') + n; };
-      var date = d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate());
-      var name = String(tpl || 'resume-{name}-{company}-{date}.json')
-        .replace(/\{name\}/g, safeFilePart(profileName, 'profile'))
-        .replace(/\{company\}/g, safeFilePart(company, 'resume'))
-        .replace(/\{date\}/g, date);
-      /* Each placeholder is already capped; clean the assembled name without
-         re-truncating it, or a long name plus a long company would eat the date
-         and the extension. The 150 is only a backstop for a silly template. */
-      name = String(name)
-        .replace(/[\u0000-\u001f\u007f]/g, '')
-        .replace(/[^A-Za-z0-9._-]+/g, '-')
-        .replace(/^[-.]+|[-.]+$/g, '');
-      if (name.length > 150) name = name.slice(0, 150).replace(/[-.]+$/, '');
-      if (!name) name = 'resume';
-      return /\.json$/i.test(name) ? name : name + '.json';
-    }
-
-    /* Returns { filename, content } or null. Never throws. */
-    function buildAttachment(ctx, company, profileName) {
-      var a = attachCfg();
-      if (!a) return null;
-      var raw = ctx && typeof ctx.json === 'string' ? ctx.json : '';
-      if (!raw.trim()) return null;
-
-      var text = raw;
-      if (a.pretty !== false) {
-        try { text = JSON.stringify(JSON.parse(raw), null, 2); } catch (e) { text = raw; }
-      }
-
-      var cap = num(a.maxBytes) || 1000000;
-      var bytes = text.length;                       // close enough; ASCII-dominated
-      try { bytes = new Blob([text]).size; } catch (e) { /* no Blob - use length */ }
-      if (bytes > cap) {
-        warnOnce('attach-big', 'the resume JSON is ' + bytes + ' bytes, over attachJson.maxBytes (' + cap + '); sending the message without it');
-        return null;
-      }
-      return { filename: attachmentName(a.filename, company, profileName), content: text };
-    }
-
-    /* --------------------------------------------------- discord format --- */
-    /* Discord embed limits: title 256, description 4096, 25 fields, field name
-       256, field value 1024, footer 2048, 6000 characters across the embed.     */
-
-    var DC = {
-      'resume.generated': { title: 'Resume generated', color: 0x57F287 },
-      'profile.updated': { title: 'Profile updated', color: 0x5865F2 },
-      'profile.exported': { title: 'Profile exported', color: 0xFEE75C },
-      'profile.imported': { title: 'Profile imported', color: 0xEB459E }
-    };
-    var SOURCES = { 'preview-download': 'Preview download', 'auto-paste': 'Auto-download on paste' };
-    var METHODS = { 'file-picker': 'Save dialog', download: 'Browser download' };
-
-    function clip(s, n) {
-      s = String(s == null ? '' : s);
-      return s.length > n ? s.slice(0, n - 1) + '\u2026' : s;
-    }
-
-    /* The company name comes from LLM output, so it is untrusted text: strip
-       control characters, escape markdown, and break @mentions (allowed_mentions
-       below also stops them pinging). */
-    function safeText(s, n) {
-      var t = String(s == null ? '' : s)
-        .replace(/[\u0000-\u001f\u007f\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]/g, ' ')
-        .replace(/\s+/g, ' ').trim();
-      t = clip(t, n)
-        .replace(/([\\*_~`|>#\[\]()])/g, '\\$1')
-        .replace(/@/g, '@\u200b');
-      return t;
-    }
-
-    function yesNo(b) { return b ? 'Yes' : 'No'; }
-    function field(name, value, inline) {
-      var v = String(value == null || value === '' ? 'n/a' : value);
-      return { name: clip(name, 256), value: clip(v, 1024), inline: inline !== false };
-    }
-    /* Same, but nothing is rendered for an empty or zero value. Keeps rows like
-       "Certifications 0" and "Bold keywords 0" out of the message instead of
-       padding it with absences. */
-    function fieldIf(name, value, inline) {
-      if (value == null || value === '' || value === 0 || value === '0') return null;
-      return field(name, value, inline);
-    }
-    function kept(list) {
-      var out = [];
-      for (var i = 0; i < list.length; i++) if (list[i]) out.push(list[i]);
-      return out;
-    }
-
-    function profileFields(p) {
-      if (!p) return [field('Profile', 'unavailable', false)];
-      var c = p.counts || {};
-      return [
-        field('Completeness', p.completeness + '% (' + p.fieldsFilled + '/' + p.fieldsTotal + ' fields)'),
-        field('Work experience', c.workExperiencesFilled + ' of ' + c.workExperiences + ' filled'),
-        field('Requested bullets', c.requestedBulletPoints),
-        field('Education', c.educationsFilled + ' of ' + c.educations + ' filled'),
-        field('Certifications', c.certificationsFilled + ' of ' + c.certifications + ' filled'),
-        field('Role-based title', yesNo(p.roleBasedJobTitle))
-      ];
-    }
-
-    function discordBody(env, ep) {
-      var d = env.data || {};
-      var meta = DC[env.type] || { title: clip(String(env.type), 200), color: 0x99AAB5 };
-      var embed = { title: meta.title, color: meta.color, fields: [] };
-      var lines = [];
-
-      /* Reading order is what happened, then who it happened to, then the
-         details. The event name is the heading (embed.title, rendered as `##` in
-         the components build) and the profile name sits right under it as a
-         sub-heading; everything else stays at body weight. */
-      lines.push('### ' + (has(d.profileName) ? safeText(d.profileName, 100) : 'Unknown profile'));
-
-      switch (env.type) {
-        case 'resume.generated': {
-          lines.push(has(d.company)
-            ? 'for **' + safeText(d.company, 200) + '**'
-            : '_Target company not specified_');
-
-          var r = d.resume || {}, s = d.settings || {};
-          embed.fields = kept([
-            field('Source', SOURCES[d.source] || d.source),
-            field('Experience', r.experienceCount),
-            field('Bullet points', r.bulletCount),
-            fieldIf('Skills', r.skillCount != null ? r.skillCount + ' in ' + r.skillCategoryCount + ' categories' : null),
-            fieldIf('Summary', r.hasSummary ? r.summaryLength + ' chars' : null),
-            fieldIf('Education', r.educationCount),
-            fieldIf('Certifications', r.certificationCount),
-            fieldIf('Bold keywords', r.boldSpans),
-            fieldIf('Layout', s.fontFamily
-              ? s.fontFamily + ' ' + (s.fontSize || '?') + 'pt · ' + (s.experienceLayout || 'default')
-              : null, false)
-          ]);
-          break;
-        }
-        case 'profile.updated':
-          embed.fields = profileFields(d.profile);
-          break;
-        case 'profile.exported':
-        case 'profile.imported':
-          embed.fields = [field('Method', METHODS[d.method] || d.method || 'File upload')]
-            .concat(profileFields(d.profile))
-            .concat([field('Includes JSON response', yesNo(d.hasJsonResponse))]);
-          break;
-        default:
-          lines.push('Unrecognised event.');
-      }
-
-      // IP / country come from a third-party lookup, so they are escaped as untrusted text.
-      var cl = d.client || {};
-      var country = has(cl.country)
-        ? safeText(cl.country, 100) + (has(cl.countryCode) ? ' (' + safeText(cl.countryCode, 2) + ')' : '')
-        : (has(cl.countryCode) ? safeText(cl.countryCode, 2) : 'unknown');
-      lines.push('\ud83c\udf10 ' + (has(cl.ip) ? '`' + safeText(cl.ip, 45) + '`' : '_unknown_') + ' \u00b7 ' + country);
-
-      embed.description = clip(lines.join(String.fromCharCode(10)), 4096);
-      embed.fields = embed.fields.slice(0, 25);
-      embed.footer = { text: clip(env.source + ' \u2022 session ' + String(env.sessionId).slice(0, 8), 2048) };
-      if (env.occurredAt) embed.timestamp = env.occurredAt;
-
-      // stay inside the 6000-character total by shedding fields from the end
-      function size(e) {
-        return (e.title || '').length + (e.description || '').length + e.footer.text.length +
-          ((e.author && e.author.name) || '').length +
-          e.fields.reduce(function (n, f) { return n + f.name.length + f.value.length; }, 0);
-      }
-      while (size(embed) > 6000 && embed.fields.length) embed.fields.pop();
-
-      /* The JSON is not attached here. Discord renders its scrollable text
-         preview only for a plain attachment, and a plain attachment always sits
-         ABOVE the embed it belongs to - so the file goes out as its own follow-up
-         message instead. That is what puts the full, explorable JSON below the
-         summary while keeping Discord's own preview. */
-      var body = {
-        embeds: [embed],
-        allowed_mentions: { parse: [] }              // never ping anyone
-      };
-      var o = ep.discord || {};
-      if (o.username) body.username = o.username;
-      if (o.avatar_url) body.avatar_url = o.avatar_url;
-      if (o.thread_name) body.thread_name = o.thread_name;
-      return body;
-    }
-
-    function discordUrl(ep, withComponents) {
-      try {
-        var u = new URL(ep.url);
-        u.searchParams.set('wait', 'true');          // report failures instead of silently dropping
-        // without this Discord ignores `components` on a plain incoming webhook
-        if (withComponents) u.searchParams.set('with_components', 'true');
-        if (ep.discord && ep.discord.threadId) u.searchParams.set('thread_id', ep.discord.threadId);
-        return u.toString();
-      } catch (e) { return ep.url; }
-    }
-
-    /* ----------------------------------------------- download button --- */
-    /* The file's URL only exists once Discord has stored it, so the button
-       cannot ride along with the upload. We post the message, read the URL back
-       from the response, then edit the message to add a link button.
-  
-       Link buttons are non-interactive, which is what lets a plain incoming
-       webhook send them - but only with `with_components=true`. If any of that
-       is refused, the message is already posted with its attachment and we just
-       log why. */
-
-    function messageUrl(ep, id) {
-      try {
-        var u = new URL(ep.url);
-        u.pathname = u.pathname.replace(/\/+$/, '') + '/messages/' + encodeURIComponent(id);
-        u.search = '';
-        u.searchParams.set('with_components', 'true');
-        if (ep.discord && ep.discord.threadId) u.searchParams.set('thread_id', ep.discord.threadId);
-        return u.toString();
-      } catch (e) { return null; }
-    }
-
-    function addDownloadButton(ep, msg, req) {
-      if (!msg || !msg.id) return Promise.resolve();
-
-      var stored = arr(msg.attachments)[0];
-      var href = stored && stored.url;
-      if (!href) return Promise.resolve();
-
-      var url = messageUrl(ep, msg.id);
-      if (!url) return Promise.resolve();
-
-      var row = {
-        type: 1,                                     // action row
-        components: [{
-          type: 2,                                   // button
-          style: 5,                                  // link - no interaction, so a webhook may send it
-          label: clip(String(req.buttonLabel || 'Download JSON'), 80),
-          url: href
-        }]
-      };
-
-      var body = { components: [row] };
-
-      var headers = { 'Content-Type': 'application/json' };
-      Object.keys(ep.headers || {}).forEach(function (k) { headers[k] = ep.headers[k]; });
-
-      return fetch(url, { method: 'PATCH', headers: headers, body: JSON.stringify(body) })
-        .then(function (res) {
-          if (res.ok) { log(LOG_PREFIX, 'download button added'); return; }
-          return describe(res).then(function (why) {
-            warnOnce('button-' + ep.id + '-' + res.status,
-              'could not add the download button (HTTP ' + res.status + '); the message and its attachment were sent normally', why);
-          });
-        })
-        .catch(function () { /* network blip - the message is already posted */ });
-    }
-
-    /* The JSON, as its own message directly under the summary. A plain
-       attachment is what gets Discord's scrollable preview of the whole file,
-       and it never expires. Best-effort: the summary is already delivered. */
-    function sendAttachmentMessage(ep, follow) {
-      var form;
-      try {
-        form = new FormData();
-        form.append('payload_json', JSON.stringify({
-          allowed_mentions: { parse: [] },
-          attachments: [{ id: 0, filename: follow.filename, description: 'JSON used to build this resume' }]
-        }));
-        form.append('files[0]',
-          new Blob([follow.content], { type: 'application/json' }),
-          follow.filename);
-      } catch (e) { return Promise.resolve(); }
-
-      var headers = {};
-      Object.keys(ep.headers || {}).forEach(function (k) { headers[k] = ep.headers[k]; });
-
-      return fetch(discordUrl(ep), { method: 'POST', headers: headers, body: form })
-        .then(function (res) {
-          if (!res.ok) {
-            return describe(res).then(function (why) {
-              warnOnce('follow-' + ep.id + '-' + res.status,
-                'the resume JSON could not be posted (HTTP ' + res.status + '); the summary message was sent normally', why);
-            });
-          }
-          log(LOG_PREFIX, 'resume JSON posted');
-          if (!follow.button) return;
-          return res.json().then(function (msg) {
-            return addDownloadButton(ep, msg, follow);
-          }).catch(function () { /* button is optional */ });
-        })
-        .catch(function () { /* network blip - the summary is already posted */ });
-    }
-
-    /* -------------------------------------------------------- transport --- */
-
-    function request(env, ep) {
-      if (ep.type === 'discord') {
-        var payload = JSON.stringify(discordBody(env, ep));
-        var req = { url: discordUrl(ep), body: payload, mode: 'cors' };
-        /* The summary goes first; the file follows in a message of its own, sent
-           once this one lands. */
-        if (env.attachment && typeof FormData === 'function' && typeof Blob === 'function') {
-          var a = attachCfg();
-          req.followUp = {
-            filename: env.attachment.filename,
-            content: env.attachment.content,
-            button: !!(a && a.button === true),
-            buttonLabel: a && a.buttonLabel
-          };
-        }
-        return req;
-      }
-      /* Generic endpoints keep their metadata-only contract: the attachment is
-         dropped rather than inlined into the envelope. */
-      var env2 = env;
-      if (env.attachment) {
-        env2 = {};
-        for (var k in env) if (env.hasOwnProperty(k) && k !== 'attachment') env2[k] = env[k];
-      }
-      return { url: ep.url, body: JSON.stringify(env2), mode: ep.mode };
-    }
-
-    /* Resolves to { result: 'ok'|'retry'|'drop'|'skip', wait?: ms } */
-    function post(env, ep) {
-      if (!ep || !ep.url) return Promise.resolve({ result: 'skip' });
-
-      var req;
-      try { req = request(env, ep); } catch (e) {
-        warnOnce('fmt-' + ep.id, 'could not build the request for ' + ep.id + '; event dropped', e);
-        return Promise.resolve({ result: 'drop' });
-      }
-
-      var opts = { method: 'POST', body: req.body, keepalive: true };
-      if (req.mode === 'no-cors') {
-        opts.mode = 'no-cors';
-        // no-cors permits only simple headers; application/json would be blocked
-        opts.headers = { 'Content-Type': 'text/plain;charset=UTF-8' };
-      } else {
-        opts.headers = { 'Content-Type': 'application/json' };
-        Object.keys(ep.headers || {}).forEach(function (k) { opts.headers[k] = ep.headers[k]; });
-      }
-
-      try {
-        return fetch(req.url, opts).then(function (res) {
-          if (opts.mode === 'no-cors') return { result: 'ok' };   // opaque response, assume sent
-          if (res.ok) {
-            /* Summary delivered. The JSON follows in its own message so Discord
-               renders it below, with its own preview. Never changes the result:
-               the summary is posted either way. */
-            if (req.followUp) {
-              return sendAttachmentMessage(ep, req.followUp)
-                .then(function () { return { result: 'ok' }; })
-                .catch(function () { return { result: 'ok' }; });
-            }
-            return { result: 'ok' };
-          }
-          if (res.status === 429) return retryAfter(res).then(function (ms) { return { result: 'retry', wait: ms }; });
-          // other client errors (bad token, deleted webhook, malformed body) will not fix themselves
-          if (res.status >= 400 && res.status < 500 && res.status !== 408) {
-            return describe(res).then(function (why) {
-              warnOnce('drop-' + ep.id + '-' + res.status, 'webhook ' + ep.id + ' rejected the event (HTTP ' + res.status + '); not retrying', why);
-              return { result: 'drop' };
-            });
-          }
-          return { result: 'retry' };
-        }).catch(function () { return { result: 'retry' }; });
-      } catch (e) {
-        return Promise.resolve({ result: 'retry' });              // fetch missing/blocked
-      }
-    }
-
-    /* Rate limits: Discord sends retry_after (seconds) in the body and a
-       Retry-After header. Capped so a bad value cannot stall the queue. */
-    function retryAfter(res) {
-      var header = 0;
-      try { header = parseFloat(res.headers && res.headers.get && res.headers.get('Retry-After')) || 0; } catch (e) { /* ignore */ }
-      var body = res.json ? res.json().catch(function () { return null; }) : Promise.resolve(null);
-      return body.then(function (j) {
-        var secs = j && typeof j.retry_after === 'number' ? j.retry_after : header;
-        return Math.min(Math.max(0, secs * 1000), 60000);
-      }).catch(function () { return 0; });
-    }
-
-    function describe(res) {
-      try {
-        if (!res.json) return Promise.resolve('');
-        return res.json().then(function (j) {
-          return j && (j.message || j.code) ? (j.code ? j.code + ' ' : '') + (j.message || '') : '';
-        }).catch(function () { return ''; });
-      } catch (e) { return Promise.resolve(''); }
-    }
-
-    function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
-
-    function deliver(env) {
-      var ep = resolve();
-      if (!ep) return Promise.resolve(true);               // nothing to do, not a failure
-      var c = cfg() || {};
-      var retry = c.retry || {};
-      var attempts = Math.max(1, num(retry.attempts) || 3);
-      var backoff = Math.max(0, num(retry.backoffMs) || 800);
-
-      function attempt(i) {
-        return post(env, ep).then(function (out) {
-          if (out.result === 'ok') { log(LOG_PREFIX, 'delivered', env.type, '->', ep.id + ' (' + ep.type + ')'); return true; }
-          if (out.result === 'skip' || out.result === 'drop') return true;   // permanent; do not queue
-          if (i + 1 >= attempts) return false;
-          var wait = out.wait != null ? out.wait : backoff * Math.pow(2, i);
-          if (out.wait != null) log(LOG_PREFIX, 'rate limited by', ep.id + ', retrying in', Math.round(wait) + 'ms');
-          return sleep(wait).then(function () { return attempt(i + 1); });
-        }).catch(function () { return false; });
-      }
-      return attempt(0);
-    }
-
-    function enqueue(env) {
-      var q = readJSON(QUEUE_KEY, []);
-      if (!Array.isArray(q)) q = [];
-      q.push(env);
-      if (q.length > MAX_QUEUE) q = q.slice(q.length - MAX_QUEUE);
-      writeJSON(QUEUE_KEY, q);
-      log(LOG_PREFIX, 'queued for retry', env.type, '(' + q.length + ' pending)');
-    }
-
-    var flushing = false;
-    function flush() {
-      if (flushing || !resolve()) return Promise.resolve();
-      var q = readJSON(QUEUE_KEY, []);
-      if (!Array.isArray(q) || !q.length) return Promise.resolve();
-      flushing = true;
-      writeJSON(QUEUE_KEY, []);
-
-      var remaining = [];
-      return q.reduce(function (chain, env) {
-        return chain.then(function () {
-          return deliver(env).then(function (ok) { if (!ok) remaining.push(env); });
-        });
-      }, Promise.resolve()).then(function () {
-        if (remaining.length) {
-          var current = readJSON(QUEUE_KEY, []);
-          writeJSON(QUEUE_KEY, remaining.concat(Array.isArray(current) ? current : []).slice(0, MAX_QUEUE));
-        }
-        flushing = false;
-      }).catch(function () { flushing = false; });
-    }
-
-    /* ------------------------------------------------------------ emit --- */
-
-    function bubble(env) {
-      try {
-        var root = document.documentElement;
-        if (!root) return;
-        var init = { detail: env, bubbles: true, cancelable: false };
-        root.dispatchEvent(new CustomEvent('resume-tailor:' + env.type, init));
-        root.dispatchEvent(new CustomEvent('resume-tailor:event', init));
-      } catch (e) { /* never let instrumentation break the app */ }
-    }
-
-    function envelope(type, data) {
-      var c = cfg();
-      return {
-        id: uuid(),
+      if (!TYPES[type]) { warnOnce('ep-type-' + id, where + ' has unknown type "' + type + '" (expected generic or discord); skipped'); continue; }
+
+      var norm = {
+        id: id,
+        label: str(ep.label) || id,
         type: type,
-        schemaVersion: SCHEMA_VERSION,
-        occurredAt: new Date().toISOString(),
-        source: (c && c.source) || 'resume-tailor',
-        sessionId: sessionId,
-        page: (function () { try { return location.origin + location.pathname; } catch (e) { return null; } })(),
-        data: data
+        url: url,
+        mode: ep.mode === 'no-cors' || ep.mode === 'cors' ? ep.mode : null,
+        headers: ep.headers && typeof ep.headers === 'object' ? ep.headers : null
+      };
+
+      if (type === 'discord') {
+        if (!pending && !DISCORD_URL.test(url)) {
+          warnOnce('ep-dcurl-' + id, where + ' is type "discord" but the url is not https://discord.com/api/webhooks/{id}/{token}; skipped');
+          continue;
+        }
+        if (norm.mode === 'no-cors') {
+          // no-cors cannot send application/json, which Discord requires
+          warnOnce('ep-dcmode-' + id, where + ': mode "no-cors" is not usable with Discord; using "cors"');
+        }
+        norm.mode = 'cors';
+        norm.discord = discordOptions(ep, where, id);
+      }
+
+      seen[id] = true;
+      out.push(norm);
+    }
+    return out;
+  }
+
+  /* Optional Discord message overrides, validated against Discord's rules so a
+     bad value is dropped with a warning instead of making every send fail. */
+  function discordOptions(ep, where, id) {
+    var o = {};
+    var username = str(ep.username);
+    if (username) {
+      // webhook names are 1-80 chars and may not contain "clyde" or "discord"
+      if (username.length > 80 || /clyde|discord/i.test(username)) {
+        warnOnce('dc-user-' + id, where + ': username must be 1-80 chars and not contain "clyde" or "discord"; ignored');
+      } else { o.username = username; }
+    }
+    var avatar = str(ep.avatarUrl);
+    if (avatar) {
+      if (/^https?:\/\//i.test(avatar)) o.avatar_url = avatar;
+      else warnOnce('dc-avatar-' + id, where + ': avatarUrl must be an http(s) url; ignored');
+    }
+    var threadId = str(ep.threadId);
+    if (threadId) {
+      if (/^\d+$/.test(threadId)) o.threadId = threadId;
+      else warnOnce('dc-thread-' + id, where + ': threadId must be a numeric snowflake; ignored');
+    }
+    var threadName = str(ep.threadName);
+    if (threadName) o.thread_name = threadName.slice(0, 100);
+    return o;
+  }
+
+  /* The id stored in the profile, or the config default when none is chosen. */
+  function selectedId() {
+    try {
+      var stored = localStorage.getItem(PROFILE_KEY);
+      if (stored) {
+        var p = JSON.parse(stored);
+        if (p && typeof p.webhookId === 'string' && p.webhookId.trim()) return p.webhookId.trim();
+      }
+    } catch (e) { /* unreadable/corrupt profile - fall through to default */ }
+    var c = cfg();
+    return c && typeof c.defaultEndpointId === 'string' ? c.defaultEndpointId.trim() : '';
+  }
+
+  /* The selected endpoint with effective mode/headers, or null when none is
+     selected (the normal case) or the selection cannot be used. */
+  function resolve() {
+    var c = cfg();
+    if (!c) return null;
+    var id = selectedId();
+    if (!id) return null;                               // "None" - optional
+    var list = endpoints();
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].id !== id) continue;
+      var ep = list[i], headers = {};
+      [c.headers, ep.headers].forEach(function (h) {
+        if (h && typeof h === 'object') Object.keys(h).forEach(function (k) { headers[k] = h[k]; });
+      });
+      return {
+        id: ep.id, type: ep.type, url: ep.url, discord: ep.discord || null,
+        mode: ep.mode || (c.mode === 'no-cors' ? 'no-cors' : 'cors'),
+        headers: headers
       };
     }
+    warnOnce('missing-' + id, 'selected webhook is not in webhook.config.js (or was skipped as invalid), so no events are being sent:', id);
+    return null;
+  }
 
-    /* Idempotency guard. The same logical action can reach RTEmit twice - most
-       often the paste flow, where a `paste` event and the following `change`
-       event both trigger the same download. We fingerprint each event by its
-       (type + redacted data) and drop an identical one seen within a short
-       window. Recorded synchronously below, before the async IP lookup, so a
-       same-tick double-fire is caught. Window is configurable (dedupeMs). */
-    var DEFAULT_DEDUPE_MS = 4000;
-    var recentSends = {};
-    function dedupeWindow() {
-      var c = cfg();
-      var n = c && c.dedupeMs != null ? Number(c.dedupeMs) : DEFAULT_DEDUPE_MS;
-      return isNaN(n) || n < 0 ? DEFAULT_DEDUPE_MS : n;
-    }
-    /* The fingerprint identifies "the same event", ignoring incidental metadata.
-       resume.generated fires from two paths (auto-paste and the preview Download
-       button) that produce near-identical messages differing only by `source`;
-       keying on profile + company collapses those into one. Other events key on
-       their full data. */
-    function dedupeKey(type, data) {
-      if (type === 'resume.generated') {
-        return type + '|' + (data.profileName || '') + '|' + (data.company || '');
-      }
-      try { return type + '|' + JSON.stringify(data); } catch (e) { return null; }
-    }
-    function isDuplicate(type, data) {
-      var win = dedupeWindow();
-      if (!win) return false;
-      var now = Date.now();
-      for (var k in recentSends) {
-        if (recentSends.hasOwnProperty(k) && now - recentSends[k] > win) delete recentSends[k];
-      }
-      var fp = dedupeKey(type, data);
-      if (fp == null) return false;
-      if (recentSends[fp] && now - recentSends[fp] < win) return true;
-      recentSends[fp] = now;
-      return false;
-    }
+  function wants(type) {
+    var c = cfg();
+    if (!c) return false;
+    var m = c.events;
+    if (!m || typeof m !== 'object') return true;
+    return m[type] !== false;
+  }
 
-    function dispatch(type, ctx) {
-      // snapshot app state and time now; the IP lookup below is asynchronous
-      var data = redact(type, ctx);
-      if (isDuplicate(type, data)) {
-        log(LOG_PREFIX, 'duplicate', type, 'suppressed (within ' + dedupeWindow() + 'ms)');
-        return Promise.resolve();
-      }
-      var at = new Date().toISOString();
+  /* ------------------------------------------------------------ utils --- */
 
-      return Promise.all([lookupClient(), urlsReady]).then(function (r) {
-        data.client = r[0];
-        var env = envelope(type, data);
-        env.occurredAt = at;
-        var ep = resolve();
+  function has(v) { return typeof v === 'string' && v.trim().length > 0; }
+  function arr(v) { return Array.isArray(v) ? v : []; }
+  function num(v) { var n = parseInt(v, 10); return isNaN(n) ? 0 : n; }
 
-        log(LOG_PREFIX, type, env.data, ep ? '(sending to ' + ep.id + ' as ' + ep.type + ')' : '(no webhook selected - log only)');
-        bubble(env);                                 // always fires, webhook or not
-
-        if (!ep || !wants(type)) return;
-
-        /* Only resume.generated carries the JSON, and only to Discord. It goes on
-           a COPY of the envelope, never on `env` itself: bubble() above handed
-           `env` straight to the DOM event as its detail, so anything added to it
-           now would still be visible there. */
-        var outgoing = env;
-        if (type === 'resume.generated' && ep.type === 'discord') {
-          var att = buildAttachment(ctx, data.company, data.profileName);
-          if (att) {
-            outgoing = {};
-            for (var k in env) if (env.hasOwnProperty(k)) outgoing[k] = env[k];
-            outgoing.attachment = att;
-          }
-        }
-
-        flush();
-        deliver(outgoing).then(function (ok) { if (!ok) enqueue(outgoing); }).catch(function () { /* ignore */ });
-      }).catch(function (e) {
-        try { console.warn(LOG_PREFIX, 'event failed', type, e); } catch (e2) { /* ignore */ }
-      });
-    }
-
-    /* profile.updated fires from an autosave that runs on every keystroke, so it
-       is debounced, and deduped against the last payload we actually sent (kept in
-       localStorage so a reload does not re-emit an unchanged profile). */
-    var timer = null;
-    function dispatchProfile(ctx) {
-      var c = cfg();
-      var wait = c && num(c.debounceMs) ? num(c.debounceMs) : 2000;
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(function () {
-        timer = null;
-        try {
-          var meta = profileMeta(ctx.profile);
-          if (!meta) return;
-          // the name is sent too, so renaming the profile counts as a change
-          var sig = JSON.stringify({ meta: meta, name: profileName(ctx) });
-          var state = readJSON(STATE_KEY, {}) || {};
-          if (state.lastProfileSig === sig) return;    // nothing materially changed
-          state.lastProfileSig = sig;
-          writeJSON(STATE_KEY, state);
-          dispatch('profile.updated', ctx);
-        } catch (e) { /* swallow */ }
-      }, wait);
-    }
-
-    window.RTEmit = function (type, ctx) {
-      try {
-        if (type === 'profile.updated') dispatchProfile(ctx || {});
-        else if (typeof type === 'string' && type) dispatch(type, ctx || {});
-      } catch (e) {
-        // instrumentation must never surface to the user
-        try { console.warn(LOG_PREFIX, 'event failed', type, e); } catch (e2) { /* ignore */ }
-      }
-    };
-
-    // Dropdown items for the Profile tab. Never throws; worst case is [].
-    window.RTWebhookOptions = function () {
-      try {
-        return endpoints().map(function (ep) { return { id: ep.id, label: ep.label }; });
-      } catch (e) { return []; }
-    };
-
-    // retry anything stranded by a previous session
+  function readJSON(key, fallback) {
     try {
-      urlsReady.then(function () {
-        if (document.readyState === 'loading') {
-          document.addEventListener('DOMContentLoaded', function () { flush(); });
-        } else { flush(); }
-      });
-    } catch (e) { /* ignore */ }
+      var raw = localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : fallback;
+    } catch (e) { return fallback; }
+  }
+
+  function writeJSON(key, value) {
+    try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { /* quota / private mode */ }
+  }
+
+  function uuid() {
+    try {
+      if (crypto && crypto.randomUUID) return crypto.randomUUID();
+    } catch (e) { /* fall through */ }
+    return 'e-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+  }
+
+  var sessionId = (function () {
+    try {
+      var id = sessionStorage.getItem('resume-tailor:session');
+      if (!id) { id = uuid(); sessionStorage.setItem('resume-tailor:session', id); }
+      return id;
+    } catch (e) { return uuid(); }
   })();
 
-  /* --- access.config.js --- */
-  /* Resume Tailor - profile access rules (blacklist)
-   *
-   * Decides which tabs a profile may open, based on the name typed into
-   * Profile > Full Name. The check re-runs every time the profile is saved
-   * (which is on every keystroke, debounced by the app's autosave), so a
-   * blocked name takes effect immediately - no reload needed.
-   *
-   * This file is the editable source of truth for the list, but it is NO LONGER
-   * served on its own - it is baked into the app bundle so it cannot be blocked
-   * by a request blocker. After editing, run:
-   *
-   *     node embed-access.mjs && node stamp-cache-version.mjs
-   *
-   * Editing it through GitHub's web UI alone will NOT change the live page.
-   *
-   * Names are stored as SALTED HASHES, not as text, so nobody can read the list
-   * out of this file or out of devtools. Add one with:
-   *
-   *     node hash-name.mjs "Some Name"
-   *
-   * and paste the line it prints into `blocklist` below. To check your work:
-   *
-   *     node hash-name.mjs --check "Some Name"
-   *
-   * WHAT THIS IS NOT: hashing hides the names from a casual reader. It is not
-   * encryption and it is not a secret - the salt and the algorithm are served to
-   * every visitor, so anyone willing to run a list of common first names through
-   * them will recover a match. And the whole guard is browser-side: it keeps a
-   * tab out of the UI, it does not protect anything behind that tab.
-   */
-  window.RT_ACCESS_CONFIG = {
-    // Master switch. false disables all blocking (every tab stays open).
-    enabled: true,
+  /* ------------------------------------------------------ client info --- */
+  /* A page cannot see its own public IP, so it is fetched from the providers in
+     config.clientInfo, tried in order. Each response shape is normalised and
+     the result cached for the session. The lookup never throws and waits at
+     most timeoutMs per provider; if every provider fails the fields are null
+     and the event is still sent. */
 
-    // Console logging when a profile is blocked or unblocked. Never logs the
-    // name itself. false to quieten it.
-    log: true,
+  var CLIENT_KEY = 'resume-tailor:client';
+  var CLIENT_RETRY_MS = 60000;
+  var clientPromise = null;
+  var clientFailedAt = 0;
 
-    /* Which tabs to hide when the profile name matches. Tab ids are the keys of
-       the app's nav: 'home', 'profile', 'preview', 'about', 'contact'.
-       A blocked tab disappears from the nav bar, and if it is the tab currently
-       open the app falls back to `fallbackTab` below. Never block 'profile' -
-       that is the only place the name can be corrected. */
-    blockedTabs: ['preview'],
+  function emptyClient() { return { ip: null, country: null, countryCode: null }; }
 
-    // Where to send someone who is sitting on a tab that just became blocked.
-    fallbackTab: 'home',
+  function clientCfg() {
+    var c = cfg();
+    var ci = c && c.clientInfo;
+    if (!ci || typeof ci !== 'object' || ci.enabled === false) return null;
+    var providers = arr(ci.providers).map(str).filter(function (u) { return /^https:\/\//i.test(u) && isValidUrl(u); });
+    if (!providers.length) return null;
+    var minutes = ci.cacheMinutes == null ? 30 : Number(ci.cacheMinutes);
+    return {
+      providers: providers,
+      timeoutMs: Math.max(200, num(ci.timeoutMs) || 3000),
+      cacheMs: Math.max(0, isNaN(minutes) ? 30 : minutes) * 60000
+    };
+  }
 
-    /* Reject names that cannot be a person's name at all - "\", "123", "asdf!!",
-       a lone letter, an emoji. This is a rule rather than a blocklist entry
-       because there is no way to enumerate every piece of junk somebody might
-       type; `blocklist` handles named individuals, this handles nonsense.
-  
-       A name passes when every character is a letter, a mark (accents and the
-       like), a space, or one of - ' . , and when it contains at least
-       `minLetters` letters in total.
-  
-       So these pass:  Ada Lovelace / O'Neill / Jean-Luc / Zoe Ångström / 李雯
-       and these do not:  \ / 123 / a / -- / test@example.com / asdf!!! / 😀
-  
-       allowEmpty  - true lets a blank name through, for when a profile is only
-                     half filled in. false (the default) treats blank as nonsense,
-                     so the gated tabs stay shut until a name is typed.
-       extraChars  - punctuation to permit on top of the defaults, as a plain
-                     string, e.g. '_/' . Regex metacharacters are taken literally.
-  
-       Set enabled: false to switch the whole rule off. */
-    nameRules: {
-      enabled: true,
-      minLetters: 2,
-      allowEmpty: false,
-      extraChars: ''
-    },
+  var IPV4 = /^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$/;
+  function isIp(v) {
+    if (typeof v !== 'string') return false;
+    v = v.trim();
+    return IPV4.test(v) || (v.indexOf(':') !== -1 && /^[0-9a-f:.]{2,45}$/i.test(v));
+  }
 
-    /* Make Profile > Integrations > Webhook a precondition for generating. With
-       this on, `blockedTabs` stays hidden until the profile points at an endpoint
-       that webhook.config.js still lists - so a profile that sends no events
-       cannot produce a resume. Selecting "None", or keeping an id that has since
-       been removed from webhook.config.js, both count as unset.
-  
-       The Profile tab marks the dropdown required while this is on.
-  
-       Safety valve: if webhook.config.js offers no usable endpoint at all, no
-       profile could ever satisfy this, so the rule is ignored (with a console
-       warning) rather than locking everyone out. */
-    requireWebhook: true,
+  function countryName(code) {
+    try {
+      if (typeof Intl !== 'undefined' && Intl.DisplayNames) {
+        var n = new Intl.DisplayNames(['en'], { type: 'region' }).of(code);
+        if (n && n !== code) return n;
+      }
+    } catch (e) { /* unknown code or no Intl support */ }
+    return null;
+  }
 
-    /* Default matching rule, applied to every entry in `blocklist` that does not
-       override it:
-         'startsWith' - the name begins with the entry ("Alex" blocks
-                        "Alex Carter", but not "Jo Alex")
-         'exact'      - the whole name equals the entry
-         'contains'   - the entry appears anywhere in the name
-       Leading/trailing spaces are always ignored. */
-    match: 'startsWith',
+  /* Understands geojs / ipwho.is ({ ip, country, country_code }),
+     ipapi.co ({ ip, country_name, country_code }) and ipinfo.io ({ ip, country: "DE" }). */
+  function normaliseClient(j) {
+    if (!j || typeof j !== 'object' || j.success === false || j.error === true) return null;
+    var ip = [j.ip, j.ipAddress, j.query].filter(isIp)[0];
+    if (!ip) return null;
+    var code = [j.country_code, j.countryCode, j.country].map(str)
+      .filter(function (c) { return /^[A-Za-z]{2}$/.test(c); })[0] || null;
+    if (code) code = code.toUpperCase();
+    var name = [j.country_name, j.countryName, j.country].map(str)
+      .filter(function (c) { return c.length > 2; })[0] || null;
+    if (!name && code) name = countryName(code);
+    return { ip: ip.trim(), country: name ? name.slice(0, 100) : null, countryCode: code };
+  }
 
-    // false (the default) matches regardless of capitalisation.
-    caseSensitive: false,
+  function withTimeout(promise, ms, onTimeout) {
+    return new Promise(function (done) {
+      var settled = false;
+      var t = setTimeout(function () {
+        if (settled) return;
+        settled = true;
+        try { if (onTimeout) onTimeout(); } catch (e) { /* ignore */ }
+        done(null);
+      }, ms);
+      promise.then(
+        function (v) { if (!settled) { settled = true; clearTimeout(t); done(v); } },
+        function () { if (!settled) { settled = true; clearTimeout(t); done(null); } }
+      );
+    });
+  }
 
-    /* Salt mixed into every hash. Its only job is to make these digests specific
-       to this deployment, so a generic rainbow table does not apply. Generate one
-       with `node hash-name.mjs --new-salt`.
-  
-       CHANGING THE SALT, `hashIterations` OR `caseSensitive` INVALIDATES EVERY
-       ENTRY BELOW - regenerate all of them if you touch any of the three. */
-    salt: 'IWMS9jOzHW3TwIEj6_IZIO0NfocOXNxe',
+  function lookupClient() {
+    var cc = clientCfg();
+    if (!cc) return Promise.resolve(emptyClient());
+    if (clientPromise) return clientPromise;
+    if (clientFailedAt && Date.now() - clientFailedAt < CLIENT_RETRY_MS) return Promise.resolve(emptyClient());
 
-    /* How many times to re-hash. Higher costs a brute-forcer more, and costs the
-       page a little on each keystroke (results are cached, so in practice only
-       the first check of a name is paid for). 1000 is a sane default; it does not
-       make the list secret, only slower to attack. */
-    hashIterations: 1000,
+    try {
+      var cached = JSON.parse(sessionStorage.getItem(CLIENT_KEY) || 'null');
+      if (cached && isIp(cached.ip) && Date.now() - cached.at < cc.cacheMs) {
+        clientPromise = Promise.resolve({ ip: cached.ip, country: cached.country || null, countryCode: cached.countryCode || null });
+        return clientPromise;
+      }
+    } catch (e) { /* no usable cache */ }
 
-    /* The blacklist. Each entry is either:
-     *
-     *   { hash: '<digest>', len: 6 }              - the normal case, from
-     *                                               `node hash-name.mjs "Name"`
-     *   { hash: '...', len: 6, match: 'exact' }   - overrides the default rule
-     *   { hash: '...', len: 6, note: 'why' }      - `note` is for humans only;
-     *                                               keep it free of the name
-     *   'PlainName'                               - still accepted, but READABLE
-     *                                               by anyone viewing source
-     *
-     *   { words: [{ hash, len }, { hash, len }] } - from
-     *                                               `node hash-name.mjs --words "First Last"`.
-     *       Matches when EVERY word appears in the name after punctuation and
-     *       spacing are stripped out, so all of these are caught:
-     *           First Last / First M Last / First Middle Last / Last, First
-     *           First M.Last / First,Last / First/Last / FirstLast
-     *       while "First Other" and "Other Last" are not. Reach for this when a
-     *       prefix entry gets dodged by padding or re-punctuating the name. The
-     *       entry-level `match` does not apply. A plain word may stand in for a
-     *       { hash, len } pair while editing, at the cost of being readable.
-     *
-     *   { words: [...], min: 2 }                  - from `--words --min 2`.
-     *       Only `min` of the listed words need appear, instead of all of them.
-     *       This is the answer to a name part being cut down to an initial: list
-     *       all three parts with min 2 and "First M Last", "F. Middle Last" and
-     *       "First Middle L." all match, while anyone who shares just one part
-     *       is untouched. Lower min means broader reach and more collateral.
-     *
-     * `len` is the character count of the hashed name. It lets the page check an
-     * entry with a single hash instead of one per prefix, and it is required for
-     * `match: 'contains'`. hash-name.mjs prints it for you.
-     *
-     * To add someone, append a line. To let someone back in, delete their line
-     * (or comment it out with //).
-     */
-    blocklist: [
-      { hash: '3d3b83832c99ef46cb1fe36acd11658ad5c1dc0ad4a2e5b8eaed4d796f8ff3f0', len: 11, note: 'C1' },
-      { hash: 'cea80e1fd4971580053b5531eb5bb05ffecae6f802ea96a1a70e11f64fe7b9a0', len: 10, note: 'C2 - variant spelling of C1' },
-      { hash: 'ee159821fa10cb3881ae8f76cf7a44f8dc8c364ca956be376fc493d639cedc12', len: 6, note: 'D1' },
-      { hash: 'b846077df641c304890ddfb3b708b15921fb3dab7a3d7d12cd88c2e2d3298bf0', len: 8, note: 'S1' },
-      { hash: '75e8e55c6e29bd38b37dfc038f27415f0c7480de3529f0cba6ea1e36f2d8897e', len: 7, note: 'I1' },
-      { hash: 'b72daa6e1bb7cad9dbd90103b00a227f2224c5b66cedfc18a70c39b4af506f17', len: 6, note: 'A1' },
-      { hash: '0eec0c0a20e9cd34fc80819c810c93798cabd34a2ef2b9b9b181849987956602', len: 5, note: 'J1' },
-      { hash: 'eb3875675f6fc860bff7857546fd1383d315dcc43c0e637981a718ded83c2dbf', len: 5, note: 'Q1' },
-      { hash: '29480caf52613aa246eb58aea82e09c2275638cae16be9c439d8b20d8676fae9', len: 5, note: 'E1' },
-      { words: [{ hash: '64e25d22647e96d912920def488d026a7c482c7c33248552ebf44c99bd5e8ea2', len: 5 }, { hash: '13e0df5c435488f58a23b0e2e832bd9244a3a08a33cbc615560ababd8a06dd8d', len: 5 }, { hash: 'b93f86f000922e439c661f5fc76ac459df13c12d4ad4eb69654582ae3d011747', len: 4 }], min: 2, note: 'K1 - any 2 of 3 name parts; prefix, whole-word and all-words entries were each dodged in turn' },
-      { hash: '426b19ec5427acfdd60773a4f351a9c91a897ee4267e7aa09d7260a2d9c11138', len: 11, note: 'M1 - full name, not just the first name' },
-      { hash: 'a15dbec9b2d0e21e7bdf5f1aa7091d9da5e8f8c168592fe4879715bb325ac736', len: 6, note: 'J2' },
-      { hash: 'c0b7b36f0b70ce0c75348321efc675071e42a0ddb931848a58a261cb7d9a1f4b', len: 5, note: 'T1' },
-      { hash: '6de43f48cc9bef5caf1cc6dd37f750fca70fabc6b72848c599d510fe8c705ee9', len: 5, note: 'J3' },
-      { words: [{ hash: '34a16d7922254527bae76c7eeae89f6b2be1564b6917fbb96f74eb3803c5b04d', len: 5 }, { hash: '4dd62701e04a1ddfc78366faff15a3b2d469b3412a76fc1a404cf4d88b9792d3', len: 6 }], note: 'A2 - full name, any order; catches surname-first forms the A3 prefix cannot' },
-      { hash: '34a16d7922254527bae76c7eeae89f6b2be1564b6917fbb96f74eb3803c5b04d', len: 5, note: 'A3 - first name prefix, deliberately broad; also catches unrelated people whose name starts the same way' },
-      { hash: '5cf468ee902912c76f8a70998fefb462ac168aa7ac87418c26906675b1c9b89d', len: 6, note: 'H1' },
-      { hash: '9bc795b3bcf26f66c63eb6ace008ce2441432a92de7afa539d1151ea6dba7d59', len: 6, note: 'S2' },
-      { hash: 'b1d2e8ad2c5e0a31422096d3bb1f773ab643069566fc7b4456b024b002fe9b5a', len: 4, note: 'K2' },
-      { hash: '4dd62701e04a1ddfc78366faff15a3b2d469b3412a76fc1a404cf4d88b9792d3', len: 6, match: 'contains', note: 'R1 - surname, matched anywhere in the name; first name not known' },
-      { hash: 'f7a1ca4a01280bdf545b589fbbbd60a0a409ea08c8a7e087eaea0b712f8581fb', len: 7, note: 'M2 - first name only; surname not known' },
-      { hash: 'bfa5efc761fb373847b512efc4337cd6916c0cecc4191abd9bc7e321ccfaf509', len: 6, note: 'A4 - first name only; surname not known' },
-      { hash: 'b05e512ea9bc91e7fea9615d5189c67d104b0a1deacc2b0e2da463846d5fcac5', len: 4, note: 'L1 - first name only; surname not known' },
-      { hash: 'c8734e4a49d40f7257367d87576cbcf48410987f4962fd4768801fe13b068ec4', len: 4, note: 'C3 - first name only; surname not known' }
-    ],
-
-    /* Shown on the page in place of a blocked tab's content, if the app ever
-       renders it before navigating away. Keep these short. `message` is the
-       fallback for a reason with no entry in `messages`. */
-    messages: {
-      blocklist: 'This profile does not have access to the Preview tab.',
-      name: 'Enter a real full name under Profile to unlock the Preview tab.',
-      webhook: 'Choose a webhook under Profile > Integrations to unlock the Preview tab.'
-    },
-    message: 'This profile does not have access to the Preview tab.'
-  };
-
-  /* --- access.js --- */
-  /* Resume Tailor - profile access guard
-   *
-   * Embedded into the top of the app bundle by embed-access.mjs, together with
-   * webhook.js and both config files - it is not served as its own <script> any
-   * more, because a blocked request used to disable it. Edit this file, then run
-   * `node embed-access.mjs && node stamp-cache-version.mjs`.
-   *
-   * Reads the rules in access.config.js and answers one question: given the
-   * profile as it stands, which tabs should be hidden?
-   *
-   * Three things can hide a tab:
-   *   blocklist - the name matches an entry in access.config.js
-   *   name      - the name cannot be anybody's name ("\", "123", "a", "asdf!!")
-   *   webhook   - `requireWebhook` is on and Profile > Integrations > Webhook is
-   *               unset, or points at an id webhook.config.js no longer lists
-   *
-   * Exposes:
-   *
-   *   window.RTAccess.setProfile(profile)  - called by the bundle whenever the
-   *                                          profile is saved (every autosave)
-   *   window.RTAccess.blockedTabs()        - ['preview'] etc, or [] when allowed
-   *   window.RTAccess.isBlockedTab(id)     - convenience for one tab id
-   *   window.RTAccess.reason()             - 'blocklist' | 'webhook' | null
-   *   window.RTAccess.requiresWebhook()    - is a webhook a precondition here?
-   *   window.RTAccess.hasWebhook()         - does the profile satisfy it?
-   *   window.RTAccess.isBlocked(name)      - the raw name test, for any caller
-   *   window.RTAccess.fallbackTab()        - tab to fall back to when kicked out
-   *   window.RTAccess.message(reason)      - text to show in a blocked tab
-   *   window.RTAccess.hash(name)           - { hash, len } to paste into the
-   *                                          config; see hash-name.mjs
-   *
-   * When the answer changes it also bubbles a DOM event from <html>, so the app
-   * (or anything else on the page) can react without polling:
-   *
-   *   document.addEventListener('resume-tailor:access-changed', e => {
-   *     e.detail.blockedTabs  // string[]
-   *     e.detail.reason       // 'blocklist' | 'webhook' | null
-   *   });
-   *
-   * The profile name never leaves the page - this file makes no requests.
-   *
-   * ON THE HASHES: blocklist entries are stored as salted SHA-256 digests so the
-   * names are not readable in this repo or in devtools. That is obfuscation, not
-   * secrecy - the salt and the algorithm ship with the page, so anyone willing to
-   * run a list of common names through them can recover a match. It stops casual
-   * reading. It does not keep a secret, and, like any browser-side guard, it does
-   * not stop someone determined to reach the code behind the tab.
-   */
-  (function () {
-    'use strict';
-
-    var EVENT = 'resume-tailor:access-changed';
-    var PROFILE_KEY = 'resume-tailor:profile';
-    var LOG_PREFIX = '[resume-tailor]';
-    var TABS = { home: 1, profile: 1, preview: 1, about: 1, contact: 1 };
-    var MATCHERS = { startsWith: 1, exact: 1, contains: 1 };
-    var MAX_NAME = 120;     // longer input is truncated before hashing
-    var MAX_CACHE = 512;
-
-    var currentProfile = { name: '', webhookId: '' };
-    var currentTabs = [];
-    var currentReason = null;
-    var warned = {};
-
-    function warnOnce(key, msg, extra) {
-      if (warned[key]) return;
-      warned[key] = true;
-      try { console.warn(LOG_PREFIX, msg, extra === undefined ? '' : extra); } catch (e) { /* ignore */ }
-    }
-
-    /* The config as written, even when disabled - hash() must keep working so a
-       new entry can be generated with blocking switched off. */
-    function rawCfg() {
-      var c = window.RT_ACCESS_CONFIG;
-      return c && typeof c === 'object' ? c : {};
-    }
-
-    function cfg() {
-      var c = rawCfg();
-      return c.enabled === false ? null : c;
-    }
-
-    function log() {
-      if (rawCfg().log === false) return;
-      try { console.log.apply(console, arguments); } catch (e) { /* no console */ }
-    }
-
-    function str(v) { return typeof v === 'string' ? v.trim() : ''; }
-
-    /* Runs of whitespace collapse to one space, so a multi-word entry still
-       matches "Ada  Lovelace" or a name pasted with a tab in it. Single-word
-       entries hash identically either way, so this does not invalidate them. */
-    function fold(s, caseSensitive) {
-      s = str(s).replace(/\s+/g, ' ');
-      /* NFKD splits accented letters into letter + mark and unpacks compatibility
-         forms (fullwidth, ligatures, roman numerals); dropping the marks then
-         leaves plain letters, so "Zoë" and "Zoe" fold the same. */
+    function tryProvider(i) {
+      if (i >= cc.providers.length) return Promise.resolve(null);
+      var ctrl = null;
+      try { ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null; } catch (e) { ctrl = null; }
+      var req;
       try {
-        s = s.normalize('NFKD').replace(/[̀-ͯ᪰-᫿⃐-⃰︠-︯]/g, '');
-      } catch (e) { /* ancient engine: carry on un-normalised */ }
-      return caseSensitive ? s : s.toLowerCase();
+        var opts = { method: 'GET', credentials: 'omit' };
+        if (ctrl) opts.signal = ctrl.signal;
+        req = Promise.resolve(fetch(cc.providers[i], opts))
+          .then(function (r) { return r && r.ok ? r.json() : null; })
+          .then(normaliseClient);
+      } catch (e) { req = Promise.resolve(null); }
+      return withTimeout(req, cc.timeoutMs, function () { if (ctrl) ctrl.abort(); })
+        .then(function (info) { return info || tryProvider(i + 1); });
     }
 
-    /* ------------------------------------------------------ confusables --- */
-    /* A name typed with lookalike characters reads identically to a human and
-       hashes completely differently - "PauI" (capital i) against "Paul", or
-       "N1na", "Mar1a", "Jam3s". Matching therefore runs on a skeleton, where
-       every character that renders like another is mapped to one canonical form.
-  
-       This deliberately merges i and l, so "PauI" matches a "Paul" entry too.
-       That is the price of closing the spoof: the pair cannot be told apart
-       visually, so the blocklist does not try to. */
-
-    var CONFUSABLE = (function () {
-      var map = {};
-      function add(canon, chars) {
-        for (var i = 0; i < chars.length; i++) map[chars.charAt(i)] = canon;
+    var pending = tryProvider(0).then(function (info) {
+      if (!info) {
+        warnOnce('client-lookup', 'could not look up IP address / country; events are sent without them');
+        clientFailedAt = Date.now();
+        clientPromise = null;                         // let a later event try again
+        return emptyClient();
       }
-      // digits, punctuation and other scripts that render as latin letters
-      /* `i` is in here on purpose. Uppercase I lowercases to i, so by the time
-         matching runs there is nothing left to tell "PauI" from "Paui"; folding
-         the whole family together is what makes the spoof fail. */
-      add('l', 'i1|!ıℐⅼɩӀІіӏ');   // i 1 | ! dotless-i, cyrillic/greek i
-      add('o', '0οоσօ۰');                       // 0, greek/cyrillic/armenian o
-      add('e', '3еҽε℮');                             // 3, cyrillic/greek e
-      add('a', '4@аαӑ');                                  // 4 @, cyrillic/greek a
-      add('s', '5$ѕ');                                              // 5 $, cyrillic dze
-      add('t', '7тτ');
-      add('b', '8вβƃ');
-      add('g', '9ɡǥ');
-      add('z', '2ƶ');
-      add('c', 'сϲⅽ');                                    // cyrillic/greek c
-      add('p', 'рρ');
-      add('x', 'хχⅹ');
-      add('y', 'уγү');
-      add('k', 'кκK');
-      add('m', 'мμⅿ');
-      add('h', 'нһң');
-      add('n', 'ոᥒ');
-      add('u', 'υս');
-      add('d', 'ԁⅾ');
-      add('q', 'ԛգ');
-      add('w', 'ѡԝ');
-      add('r', 'гᴦ');
-      add('v', 'νⅴ');
-      add('j', 'јϳ');
-      add('f', 'ſ');
-      return map;
-    })();
+      clientFailedAt = 0;
+      try {
+        sessionStorage.setItem(CLIENT_KEY, JSON.stringify({ at: Date.now(), ip: info.ip, country: info.country, countryCode: info.countryCode }));
+      } catch (e) { /* storage unavailable */ }
+      return info;
+    }).catch(function () { clientPromise = null; return emptyClient(); });
+    clientPromise = pending;
+    return pending;
+  }
 
-    /* The matching form of a name: folded, then lookalikes canonicalised. */
-    function skeleton(s, caseSensitive) {
-      var f = fold(s, caseSensitive);
-      var out = '', i, ch;
-      for (i = 0; i < f.length; i++) {
-        ch = f.charAt(i);
-        out += CONFUSABLE[ch] || ch;
+  /* ---------------------------------------------------------- redact --- */
+  /* The only place app state is turned into an outbound payload.           */
+
+  function profileMeta(p) {
+    if (!p || typeof p !== 'object') return null;
+    var work = arr(p.workExperiences), edu = arr(p.educations), cert = arr(p.certifications);
+
+    // booleans only - which fields are filled, never their values
+    var fields = {
+      fullName: has(p.fullName), email: has(p.email), phone: has(p.phone),
+      location: has(p.location), linkedIn: has(p.linkedIn), gitHub: has(p.gitHub),
+      website: has(p.website), seniority: has(p.seniority), jobTitle: has(p.jobTitle)
+    };
+    var names = Object.keys(fields);
+    var filled = names.filter(function (k) { return fields[k]; }).length;
+
+    return {
+      fields: fields,
+      fieldsFilled: filled,
+      fieldsTotal: names.length,
+      completeness: names.length ? Math.round((filled / names.length) * 100) : 0,
+      roleBasedJobTitle: !!p.roleBasedJobTitle,
+      // whether a webhook is selected - never which one or where it points
+      webhookConfigured: has(p.webhookId),
+      counts: {
+        workExperiences: work.length,
+        workExperiencesFilled: work.filter(function (e) { return has(e && e.company); }).length,
+        educations: edu.length,
+        educationsFilled: edu.filter(function (e) { return has(e && e.degreeMajor); }).length,
+        certifications: cert.length,
+        certificationsFilled: cert.filter(function (e) { return has(e && e.certification); }).length,
+        requestedBulletPoints: work.reduce(function (n, e) { return n + num(e && e.bulletPoints); }, 0)
       }
-      return out;
-    }
+    };
+  }
 
-    /* ---------------------------------------------------------- sha-256 --- */
-    /* Plain synchronous SHA-256. WebCrypto is async, and the name check runs
-       inside a React render, which cannot wait for a promise. */
+  function resumeMeta(r) {
+    if (!r || typeof r !== 'object') return null;
+    var exp = arr(r.experience), skills = arr(r.skills);
+    return {
+      experienceCount: exp.length,
+      bulletCount: exp.reduce(function (n, e) { return n + arr(e && e.bullets).length; }, 0),
+      skillCategoryCount: skills.length,
+      skillCount: skills.reduce(function (n, s) { return n + arr(s && s.skills).length; }, 0),
+      educationCount: arr(r.education).length,
+      certificationCount: arr(r.certifications).length,
+      hasSummary: has(r.summary),
+      summaryLength: has(r.summary) ? r.summary.trim().length : 0,
+      // how many <b> spans the LLM produced, i.e. keyword emphasis density
+      boldSpans: exp.reduce(function (n, e) {
+        return n + arr(e && e.bullets).reduce(function (m, b) {
+          return m + (String(b).match(/<b>/gi) || []).length;
+        }, 0);
+      }, 0)
+    };
+  }
 
-    var K = [
-      0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-      0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-      0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-      0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-      0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-      0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-      0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-      0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+  function settingsMeta(s) {
+    if (!s || typeof s !== 'object') return null;
+    var p = s.primary || {}, l = s.pageLayout || {};
+    return {
+      fontFamily: p.fontFamily || null,
+      fontSize: p.fontSize || null,
+      experienceLayout: s.experienceLayout || null,
+      boostEducation: !!s.boostEducation,
+      pageMargin: l.pageMargin || null
+    };
+  }
+
+  /* The profile name for any event. Profile events carry the profile; the two
+     resume.generated calls carry the rendered resume (whose `name` is the
+     profile's full name). We try, in order: the event's own profile, the
+     event's resume, then ALWAYS the saved profile - so no event can omit the
+     name while one is saved. Returns null only when no name exists anywhere. */
+  function profileName(ctx) {
+    ctx = ctx || {};
+    var candidates = [
+      ctx.profile && typeof ctx.profile === 'object' ? ctx.profile.fullName : null,
+      ctx.resume && typeof ctx.resume === 'object' ? ctx.resume.name : null
     ];
+    var n = candidates.filter(has)[0];
+    if (!has(n)) {
+      var p = readJSON(PROFILE_KEY, null);
+      if (p && has(p.fullName)) n = p.fullName;
+    }
+    return has(n) ? n.trim().replace(/\s+/g, ' ').slice(0, 100) : null;
+  }
 
-    function rotr(x, n) { return (x >>> n) | (x << (32 - n)); }
+  function redact(type, ctx) {
+    ctx = ctx || {};
+    var data = { profileName: profileName(ctx) };
+    switch (type) {
+      case 'profile.updated':
+        data.profile = profileMeta(ctx.profile);
+        break;
+      case 'resume.generated':
+        data.company = has(ctx.company) ? ctx.company.trim() : null;
+        data.source = ctx.source || null;
+        data.resume = resumeMeta(ctx.resume);
+        data.settings = settingsMeta(ctx.settings);
+        break;
+      case 'profile.exported':
+      case 'profile.imported':
+        data.method = ctx.method || null;
+        data.profile = profileMeta(ctx.profile);
+        data.settings = settingsMeta(ctx.settings);
+        data.hasJsonResponse = has(ctx.jsonResponse);
+        break;
+      default:
+        break;
+    }
+    return data;
+  }
 
-    function utf8(s) {
-      var out = [], i, c, c2, cp;
-      for (i = 0; i < s.length; i++) {
-        c = s.charCodeAt(i);
-        if (c < 0x80) out.push(c);
-        else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
-        else if (c >= 0xd800 && c < 0xdc00 && i + 1 < s.length) {
-          c2 = s.charCodeAt(i + 1);
-          cp = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
-          i++;
-          out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 63), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63));
-        } else out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
-      }
-      return out;
+  /* ------------------------------------------------ json attachment --- */
+  /* resume.generated can carry the JSON response that produced the resume, so
+     it arrives in Discord as a downloadable file. Unlike everything else here
+     this is real content, not a count - see attachJson in webhook.config.js.
+     Kept on the envelope rather than in `data`, so it never reaches the DOM
+     event, the dedupe fingerprint or a generic endpoint's payload. */
+
+  function attachCfg() {
+    var c = cfg();
+    var a = c && c.attachJson;
+    if (!a || typeof a !== 'object' || a.enabled === false) return null;
+    return a;
+  }
+
+  function safeFilePart(s, fallback, max) {
+    var t = String(s == null ? '' : s)
+      .replace(/[\u0000-\u001f\u007f]/g, '')
+      .replace(/[^A-Za-z0-9._-]+/g, '-')
+      .replace(/^[-.]+|[-.]+$/g, '')
+      .slice(0, max || 40)
+      .replace(/[-.]+$/, '');
+    return t || fallback;
+  }
+
+  function attachmentName(tpl, company, profileName) {
+    var d = new Date();
+    var p = function (n) { return (n < 10 ? '0' : '') + n; };
+    var date = d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate());
+    var name = String(tpl || 'resume-{name}-{company}-{date}.json')
+      .replace(/\{name\}/g, safeFilePart(profileName, 'profile'))
+      .replace(/\{company\}/g, safeFilePart(company, 'resume'))
+      .replace(/\{date\}/g, date);
+    /* Each placeholder is already capped; clean the assembled name without
+       re-truncating it, or a long name plus a long company would eat the date
+       and the extension. The 150 is only a backstop for a silly template. */
+    name = String(name)
+      .replace(/[\u0000-\u001f\u007f]/g, '')
+      .replace(/[^A-Za-z0-9._-]+/g, '-')
+      .replace(/^[-.]+|[-.]+$/g, '');
+    if (name.length > 150) name = name.slice(0, 150).replace(/[-.]+$/, '');
+    if (!name) name = 'resume';
+    return /\.json$/i.test(name) ? name : name + '.json';
+  }
+
+  /* Returns { filename, content } or null. Never throws. */
+  function buildAttachment(ctx, company, profileName) {
+    var a = attachCfg();
+    if (!a) return null;
+    var raw = ctx && typeof ctx.json === 'string' ? ctx.json : '';
+    if (!raw.trim()) return null;
+
+    var text = raw;
+    if (a.pretty !== false) {
+      try { text = JSON.stringify(JSON.parse(raw), null, 2); } catch (e) { text = raw; }
     }
 
-    function sha256(bytes) {
-      var H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
-      var bits = bytes.length * 8;
-      var m = bytes.slice();
-      m.push(0x80);
-      while (m.length % 64 !== 56) m.push(0);
-      m.push(0, 0, 0, 0, (bits >>> 24) & 255, (bits >>> 16) & 255, (bits >>> 8) & 255, bits & 255);
-
-      var w = new Array(64), i, t, a, b, c, d, e, f, g, h, s0, s1, S0, S1, ch, maj, t1, t2;
-      for (i = 0; i < m.length; i += 64) {
-        for (t = 0; t < 16; t++) {
-          w[t] = (m[i + 4 * t] << 24) | (m[i + 4 * t + 1] << 16) | (m[i + 4 * t + 2] << 8) | m[i + 4 * t + 3];
-        }
-        for (t = 16; t < 64; t++) {
-          s0 = rotr(w[t - 15], 7) ^ rotr(w[t - 15], 18) ^ (w[t - 15] >>> 3);
-          s1 = rotr(w[t - 2], 17) ^ rotr(w[t - 2], 19) ^ (w[t - 2] >>> 10);
-          w[t] = (w[t - 16] + s0 + w[t - 7] + s1) | 0;
-        }
-        a = H[0]; b = H[1]; c = H[2]; d = H[3]; e = H[4]; f = H[5]; g = H[6]; h = H[7];
-        for (t = 0; t < 64; t++) {
-          S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
-          ch = (e & f) ^ (~e & g);
-          t1 = (h + S1 + ch + K[t] + w[t]) | 0;
-          S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
-          maj = (a & b) ^ (a & c) ^ (b & c);
-          t2 = (S0 + maj) | 0;
-          h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
-        }
-        H[0] = (H[0] + a) | 0; H[1] = (H[1] + b) | 0; H[2] = (H[2] + c) | 0; H[3] = (H[3] + d) | 0;
-        H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;
-      }
-      var out = [];
-      for (i = 0; i < 8; i++) out.push((H[i] >>> 24) & 255, (H[i] >>> 16) & 255, (H[i] >>> 8) & 255, H[i] & 255);
-      return out;
-    }
-
-    function hex(bytes) {
-      var s = '';
-      for (var i = 0; i < bytes.length; i++) s += (bytes[i] < 16 ? '0' : '') + bytes[i].toString(16);
-      return s;
-    }
-
-    /* Typing re-hashes the same prefixes over and over, so memoise. Keyed by the
-       settings too, so editing the config from a console still behaves. */
-    var cache = Object.create(null);
-    var cacheN = 0;
-
-    function digest(value) {
-      var c = rawCfg();
-      var salt = str(c.salt);
-      var iter = typeof c.hashIterations === 'number' && c.hashIterations > 0 ? (c.hashIterations | 0) : 1;
-      var key = iter + '\u001f' + salt + '\u001f' + value;
-
-      if (cache[key] !== undefined) return cache[key];
-      var b = sha256(utf8(salt + '\u001f' + value));
-      for (var i = 1; i < iter; i++) b = sha256(b);
-      var out = hex(b);
-
-      if (cacheN >= MAX_CACHE) { cache = Object.create(null); cacheN = 0; }
-      cache[key] = out;
-      cacheN++;
-      return out;
-    }
-
-    /* --------------------------------------------------------- matching --- */
-
-    function defaultMatch() {
-      var c = cfg();
-      var m = str(c && c.match) || 'startsWith';
-      if (!MATCHERS[m]) {
-        warnOnce('match-' + m, 'access.config.js has unknown match "' + m + '" (expected startsWith, exact or contains); using startsWith');
-        return 'startsWith';
-      }
-      return m;
-    }
-
-    /* --- word matching, for names edited to dodge a prefix entry --- */
-    /* "Ada Lovelace" as a prefix misses "Ada Byron Lovelace". An allWords entry
-       instead requires every listed word to appear in the name with everything
-       that is not a letter stripped out first - so middle names, initials,
-       reordering, odd separators and no separator at all are all caught:
-         Ada Byron Lovelace / Ada B.Lovelace / Lovelace,Ada / AdaLovelace
-       while anyone sharing only one of the words is left alone.
-  
-       `min` relaxes "every word" to "at least this many", which is what answers
-       a name part being cut down to an initial: list all three parts with min 2
-       and "A. Byron Lovelace" and "Ada B. Lovelace" both still match, yet
-       somebody who shares a single part does not. */
-
-    var HEX64 = /^[0-9a-f]{64}$/;
-
-    function trimEdges(w) {
-      try {
-        return w.replace(/^[^\p{L}\p{M}]+/u, '').replace(/[^\p{L}\p{M}]+$/u, '');
-      } catch (e) {
-        var cls = 'A-Za-zÀ-ɏͰ-ϿЀ-ӿ';
-        return w.replace(new RegExp('^[^' + cls + ']+'), '').replace(new RegExp('[^' + cls + ']+$'), '');
-      }
-    }
-
-    /* Words of an already-folded name. Punctuation is stripped from each edge, so
-       "Lovelace," matches "lovelace"; a hyphenated word yields the whole thing
-       and its parts, so "Jean-Luc" matches jean-luc, jean and luc. */
-    function wordsOf(subject) {
-      var raw = subject.split(' '), out = [], seen = Object.create(null), i, j, parts;
-
-      function add(w) { if (w && !seen['#' + w]) { seen['#' + w] = 1; out.push(w); } }
-
-      for (i = 0; i < raw.length; i++) {
-        var w = trimEdges(raw[i]);
-        add(w);
-        if (w.indexOf('-') !== -1) {
-          parts = w.split('-');
-          for (j = 0; j < parts.length; j++) add(trimEdges(parts[j]));
-        }
-      }
-      return out;
-    }
-
-    /* Everything that is not a letter or a mark, removed. Matching against this
-       is what makes the separator irrelevant: "Ada B.Lovelace", "Ada,Lovelace",
-       "Ada/Lovelace" and "AdaLovelace" all compact to the same letters, so none
-       of them can slip past an entry that the spaced form matches. */
-    function compact(s) {
-      try {
-        return s.replace(/[^\p{L}\p{M}]+/gu, '');
-      } catch (e) {
-        var cls = 'A-Za-zÀ-ɏͰ-ϿЀ-ӿ';
-        return s.replace(new RegExp('[^' + cls + ']+', 'g'), '');
-      }
-    }
-
-    /* Is `hash` the digest of any `len`-character window of `flat`? One digest
-       per window, and digests are memoised, so typing pays for each window once. */
-    function hasWindow(flat, hash, len) {
-      if (len <= 0 || len > flat.length) return false;
-      for (var s = 0; s + len <= flat.length; s++) {
-        if (digest(flat.substr(s, len)) === hash) return true;
-      }
-      return false;
-    }
-
-    /* How many of the entry's words must appear. Defaults to all of them; `min`
-       lowers the bar, so ['first','middle','last'] with min 2 still catches a
-       name that has dropped one part down to an initial. */
-    function wordsNeeded(entry, total) {
-      var min = entry.min;
-      if (typeof min !== 'number' || min < 1) return total;
-      return min > total ? total : (min | 0);
-    }
-
-    /* Counts how many of the entry's words appear in the compacted name, and
-       compares that against `min`. Each word is { hash, len }, or a plain word
-       while editing (readable, but handy). */
-    function hitWords(subject, entry, caseSensitive, idx) {
-      var list = entry.words;
-      if (!list.length) return false;
-      var flat = compact(subject);
-      if (!flat) return false;
-
-      var tokens = null;   // built only for a legacy hash that carries no len
-      var found = 0, usable = 0;
-
-      for (var i = 0; i < list.length; i++) {
-        var item = list[i], hash = '', len = -1, word = '', ok = false;
-
-        if (item && typeof item === 'object') {
-          hash = str(item.hash).toLowerCase();
-          if (typeof item.len === 'number' && item.len > 0) len = item.len | 0;
-          if (!hash) word = str(item.value);
-        } else {
-          var raw = str(item);
-          if (HEX64.test(raw.toLowerCase())) hash = raw.toLowerCase();
-          else word = raw;
-        }
-
-        if (word) {
-          var needle = compact(skeleton(word, caseSensitive));
-          if (!needle) continue;
-          usable++;
-          ok = flat.indexOf(needle) !== -1;
-        } else if (!hash) {
-          continue;
-        } else if (len > 0) {
-          usable++;
-          ok = hasWindow(flat, hash, len);
-        } else {
-          /* No len recorded: all we can do is compare whole words, which is what
-             this used to do and what "Ada B.Lovelace" defeats. */
-          warnOnce('words-nolen-' + idx, 'access.config.js blocklist entry #' + (idx + 1) + ' has a words[] hash with no len, so it can only be matched as a whole word and will miss names written without separators. Regenerate it with: node hash-name.mjs --words "First Last"');
-          usable++;
-          if (tokens === null) {
-            tokens = [];
-            var ws = wordsOf(subject);
-            for (var j = 0; j < ws.length; j++) tokens.push(digest(ws[j]));
-          }
-          ok = tokens.indexOf(hash) !== -1;
-        }
-
-        if (ok) found++;
-      }
-
-      return usable > 0 && found >= wordsNeeded(entry, usable);
-    }
-
-    function hitPlain(subject, needle, mode) {
-      if (mode === 'exact') return subject === needle;
-      if (mode === 'contains') return subject.indexOf(needle) !== -1;
-      return subject.indexOf(needle) === 0;
-    }
-
-    /* `len` is the length of the hashed name. Recording it keeps this to one hash
-       per entry instead of one per prefix; without it we have to scan. */
-    function hitHash(subject, hash, len, mode, i) {
-      var s;
-      if (len > 0) {
-        if (len > subject.length) return false;
-        if (mode === 'exact') return len === subject.length && digest(subject) === hash;
-        if (mode === 'startsWith') return digest(subject.slice(0, len)) === hash;
-        for (s = 0; s + len <= subject.length; s++) if (digest(subject.substr(s, len)) === hash) return true;
-        return false;
-      }
-      if (mode === 'exact') return digest(subject) === hash;
-      if (mode === 'startsWith') {
-        for (s = 1; s <= subject.length; s++) if (digest(subject.slice(0, s)) === hash) return true;
-        return false;
-      }
-      warnOnce('hash-contains-' + i, 'access.config.js blocklist entry #' + (i + 1) + ' uses match "contains" with a hash but no len, so it cannot be checked; add len (hash-name.mjs prints it) or use startsWith. Entry skipped');
-      return false;
-    }
-
-    /* True when `name` is on the blacklist. Safe to call with anything. */
-    function isBlocked(name) {
-      var c = cfg();
-      if (!c) return false;
-
-      var caseSensitive = c.caseSensitive === true;
-      var subject = skeleton(name, caseSensitive);
-      if (!subject) return false;
-      if (subject.length > MAX_NAME) subject = subject.slice(0, MAX_NAME);
-
-      var list = Array.isArray(c.blocklist) ? c.blocklist : [];
-      var fallback = defaultMatch();
-
-      for (var i = 0; i < list.length; i++) {
-        var entry = list[i], mode = fallback, plain = '', hash = '', len = -1, m;
-
-        /* An entry carrying `words` is an allWords entry; order and anything
-           between the words is irrelevant. */
-        if (entry && typeof entry === 'object' && Array.isArray(entry.words)) {
-          if (hitWords(subject, entry, caseSensitive, i)) return true;
-          continue;
-        }
-
-        if (entry && typeof entry === 'object') {
-          if (entry.match !== undefined) {
-            m = str(entry.match);
-            if (MATCHERS[m]) mode = m;
-            else warnOnce('emm-' + i, 'access.config.js blocklist entry #' + (i + 1) + ' has unknown match "' + m + '"; using ' + fallback);
-          }
-          if (str(entry.hash)) {
-            hash = str(entry.hash).toLowerCase();
-            if (typeof entry.len === 'number' && entry.len > 0) len = entry.len | 0;
-          } else {
-            plain = skeleton(entry.value, caseSensitive);
-          }
-        } else {
-          plain = skeleton(entry, caseSensitive);
-        }
-
-        if (hash) { if (hitHash(subject, hash, len, mode, i)) return true; }
-        else if (plain) { if (hitPlain(subject, plain, mode)) return true; }
-        else warnOnce('empty-' + i, 'access.config.js blocklist entry #' + (i + 1) + ' has neither value nor hash; skipped');
-      }
-      return false;
-    }
-
-    /* ------------------------------------------------------- name rule --- */
-    /* Rejects input that cannot be anybody's name: "\", "123", "a", "asdf!!".
-       Unenumerable, so it is a rule and not a blocklist entry. */
-
-    var NAME_PUNCT = " \\-'\u2019.,";   // space, hyphen, both apostrophes, dot, comma
-    var nameRe;                         // built once, lazily
-
-    function escapeClass(s) {
-      return String(s === undefined || s === null ? '' : s).replace(/[\\\]^-]/g, '\\$&');
-    }
-
-    function nameRegex() {
-      if (nameRe !== undefined) return nameRe;
-      var extra = escapeClass(nameCfg().extraChars);
-      try {
-        /* \p{L} letters, \p{M} combining marks - covers accents, and scripts
-           beyond Latin. Needs the u flag (ES2018). */
-        nameRe = new RegExp('^[\\p{L}\\p{M}' + NAME_PUNCT + extra + ']+$', 'u');
-      } catch (e) {
-        /* Engine without unicode property escapes: fall back to the common Latin
-           and Cyrillic/Greek ranges. Stricter than above, never looser. */
-        warnOnce('name-re', 'this browser lacks unicode property escapes in regexes; the name rule is using a narrower Latin/Greek/Cyrillic fallback');
-        nameRe = new RegExp('^[A-Za-z\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF' + NAME_PUNCT + extra + ']+$');
-      }
-      return nameRe;
-    }
-
-    function letterCount(s) {
-      var re;
-      try { re = /[\p{L}]/gu; } catch (e) { re = /[A-Za-z\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF]/g; }
-      var m = s.match(re);
-      return m ? m.length : 0;
-    }
-
-    function nameCfg() {
-      var c = cfg();
-      var n = c && c.nameRules && typeof c.nameRules === 'object' ? c.nameRules : null;
-      return n || {};
-    }
-
-    /* True when the name cannot be a person's name. Empty is governed by
-       allowEmpty, so a half-filled profile can be treated either way. */
-    function implausibleName(name) {
-      var n = nameCfg();
-      if (!cfg() || n.enabled === false) return false;
-
-      var v = fold(name, true);                 // case is irrelevant to shape
-      if (!v) return n.allowEmpty === true ? false : true;
-
-      var min = typeof n.minLetters === 'number' && n.minLetters >= 0 ? n.minLetters : 2;
-      if (letterCount(v) < min) return true;
-      return !nameRegex().test(v);
-    }
-
-    /* --------------------------------------------------- webhook rule --- */
-    /* `requireWebhook` makes the Profile > Integrations > Webhook dropdown a
-       precondition: until it points at an endpoint that webhook.config.js still
-       lists, the profile is treated exactly like a blocked one. */
-
-    function webhookOptions() {
-      try {
-        var o = window.RTWebhookOptions && window.RTWebhookOptions();
-        return Array.isArray(o) ? o : [];
-      } catch (e) { return []; }
-    }
-
-    function requiresWebhook() {
-      var c = cfg();
-      if (!c || c.requireWebhook !== true) return false;
-      /* No endpoints to pick from means no profile could ever satisfy the rule,
-         which would lock everyone out of the app. Refuse to enforce it. */
-      if (webhookOptions().length === 0) {
-        warnOnce('rw-empty', 'access.config.js sets requireWebhook: true, but webhook.config.js offers no usable endpoint, so no profile could ever satisfy it. The requirement is ignored until at least one endpoint exists.');
-        return false;
-      }
-      return true;
-    }
-
-    function hasWebhook(id) {
-      id = str(id);
-      if (!id) return false;
-      var o = webhookOptions();
-      for (var i = 0; i < o.length; i++) if (o[i] && o[i].id === id) return true;
-      return false;   // selected, but no longer listed in webhook.config.js
-    }
-
-    /* 'blocklist', 'name', 'webhook', or null when the profile is fine. */
-    function reasonFor(p) {
-      if (!cfg()) return null;
-      if (isBlocked(p.name)) return 'blocklist';
-      if (implausibleName(p.name)) return 'name';
-      if (requiresWebhook() && !hasWebhook(p.webhookId)) return 'webhook';
+    var cap = num(a.maxBytes) || 1000000;
+    var bytes = text.length;                       // close enough; ASCII-dominated
+    try { bytes = new Blob([text]).size; } catch (e) { /* no Blob - use length */ }
+    if (bytes > cap) {
+      warnOnce('attach-big', 'the resume JSON is ' + bytes + ' bytes, over attachJson.maxBytes (' + cap + '); sending the message without it');
       return null;
     }
+    return { filename: attachmentName(a.filename, company, profileName), content: text };
+  }
 
-    /* --------------------------------------------------------- the tabs --- */
+  /* --------------------------------------------------- discord format --- */
+  /* Discord embed limits: title 256, description 4096, 25 fields, field name
+     256, field value 1024, footer 2048, 6000 characters across the embed.     */
 
-    function configuredTabs() {
-      var c = cfg();
-      var list = c && Array.isArray(c.blockedTabs) ? c.blockedTabs : ['preview'];
-      var out = [];
-      for (var i = 0; i < list.length; i++) {
-        var id = str(list[i]);
-        if (!id) continue;
-        if (!TABS[id]) { warnOnce('tab-' + id, 'access.config.js blockedTabs has unknown tab "' + id + '" (expected ' + Object.keys(TABS).join(', ') + '); ignored'); continue; }
-        if (out.indexOf(id) === -1) out.push(id);
+  var DC = {
+    'resume.generated': { title: 'Resume generated', color: 0x57F287 },
+    'profile.updated': { title: 'Profile updated', color: 0x5865F2 },
+    'profile.exported': { title: 'Profile exported', color: 0xFEE75C },
+    'profile.imported': { title: 'Profile imported', color: 0xEB459E }
+  };
+  var SOURCES = { 'preview-download': 'Preview download', 'auto-paste': 'Auto-download on paste' };
+  var METHODS = { 'file-picker': 'Save dialog', download: 'Browser download' };
+
+  function clip(s, n) {
+    s = String(s == null ? '' : s);
+    return s.length > n ? s.slice(0, n - 1) + '\u2026' : s;
+  }
+
+  /* The company name comes from LLM output, so it is untrusted text: strip
+     control characters, escape markdown, and break @mentions (allowed_mentions
+     below also stops them pinging). */
+  function safeText(s, n) {
+    var t = String(s == null ? '' : s)
+      .replace(/[\u0000-\u001f\u007f\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]/g, ' ')
+      .replace(/\s+/g, ' ').trim();
+    t = clip(t, n)
+      .replace(/([\\*_~`|>#\[\]()])/g, '\\$1')
+      .replace(/@/g, '@\u200b');
+    return t;
+  }
+
+  function yesNo(b) { return b ? 'Yes' : 'No'; }
+  function field(name, value, inline) {
+    var v = String(value == null || value === '' ? 'n/a' : value);
+    return { name: clip(name, 256), value: clip(v, 1024), inline: inline !== false };
+  }
+  /* Same, but nothing is rendered for an empty or zero value. Keeps rows like
+     "Certifications 0" and "Bold keywords 0" out of the message instead of
+     padding it with absences. */
+  function fieldIf(name, value, inline) {
+    if (value == null || value === '' || value === 0 || value === '0') return null;
+    return field(name, value, inline);
+  }
+  function kept(list) {
+    var out = [];
+    for (var i = 0; i < list.length; i++) if (list[i]) out.push(list[i]);
+    return out;
+  }
+
+  function profileFields(p) {
+    if (!p) return [field('Profile', 'unavailable', false)];
+    var c = p.counts || {};
+    return [
+      field('Completeness', p.completeness + '% (' + p.fieldsFilled + '/' + p.fieldsTotal + ' fields)'),
+      field('Work experience', c.workExperiencesFilled + ' of ' + c.workExperiences + ' filled'),
+      field('Requested bullets', c.requestedBulletPoints),
+      field('Education', c.educationsFilled + ' of ' + c.educations + ' filled'),
+      field('Certifications', c.certificationsFilled + ' of ' + c.certifications + ' filled'),
+      field('Role-based title', yesNo(p.roleBasedJobTitle))
+    ];
+  }
+
+  function discordBody(env, ep) {
+    var d = env.data || {};
+    var meta = DC[env.type] || { title: clip(String(env.type), 200), color: 0x99AAB5 };
+    var embed = { title: meta.title, color: meta.color, fields: [] };
+    var lines = [];
+
+    /* Reading order is what happened, then who it happened to, then the
+       details. The event name is the heading (embed.title, rendered as `##` in
+       the components build) and the profile name sits right under it as a
+       sub-heading; everything else stays at body weight. */
+    lines.push('### ' + (has(d.profileName) ? safeText(d.profileName, 100) : 'Unknown profile'));
+
+    switch (env.type) {
+      case 'resume.generated': {
+        lines.push(has(d.company)
+          ? 'for **' + safeText(d.company, 200) + '**'
+          : '_Target company not specified_');
+
+        var r = d.resume || {}, s = d.settings || {};
+        embed.fields = kept([
+          field('Source', SOURCES[d.source] || d.source),
+          field('Experience', r.experienceCount),
+          field('Bullet points', r.bulletCount),
+          fieldIf('Skills', r.skillCount != null ? r.skillCount + ' in ' + r.skillCategoryCount + ' categories' : null),
+          fieldIf('Summary', r.hasSummary ? r.summaryLength + ' chars' : null),
+          fieldIf('Education', r.educationCount),
+          fieldIf('Certifications', r.certificationCount),
+          fieldIf('Bold keywords', r.boldSpans),
+          fieldIf('Layout', s.fontFamily
+            ? s.fontFamily + ' ' + (s.fontSize || '?') + 'pt · ' + (s.experienceLayout || 'default')
+            : null, false)
+        ]);
+        break;
       }
-      return out;
+      case 'profile.updated':
+        embed.fields = profileFields(d.profile);
+        break;
+      case 'profile.exported':
+      case 'profile.imported':
+        embed.fields = [field('Method', METHODS[d.method] || d.method || 'File upload')]
+          .concat(profileFields(d.profile))
+          .concat([field('Includes JSON response', yesNo(d.hasJsonResponse))]);
+        break;
+      default:
+        lines.push('Unrecognised event.');
     }
 
-    function fallbackTab() {
-      var c = cfg();
-      var id = str(c && c.fallbackTab) || 'home';
-      return TABS[id] ? id : 'home';
+    // IP / country come from a third-party lookup, so they are escaped as untrusted text.
+    var cl = d.client || {};
+    var country = has(cl.country)
+      ? safeText(cl.country, 100) + (has(cl.countryCode) ? ' (' + safeText(cl.countryCode, 2) + ')' : '')
+      : (has(cl.countryCode) ? safeText(cl.countryCode, 2) : 'unknown');
+    lines.push('\ud83c\udf10 ' + (has(cl.ip) ? '`' + safeText(cl.ip, 45) + '`' : '_unknown_') + ' \u00b7 ' + country);
+
+    embed.description = clip(lines.join(String.fromCharCode(10)), 4096);
+    embed.fields = embed.fields.slice(0, 25);
+    embed.footer = { text: clip(env.source + ' \u2022 session ' + String(env.sessionId).slice(0, 8), 2048) };
+    if (env.occurredAt) embed.timestamp = env.occurredAt;
+
+    // stay inside the 6000-character total by shedding fields from the end
+    function size(e) {
+      return (e.title || '').length + (e.description || '').length + e.footer.text.length +
+        ((e.author && e.author.name) || '').length +
+        e.fields.reduce(function (n, f) { return n + f.name.length + f.value.length; }, 0);
     }
+    while (size(embed) > 6000 && embed.fields.length) embed.fields.pop();
 
-    /* `reason` defaults to why the current profile is blocked. */
-    function message(reason) {
-      var c = cfg() || {};
-      var m = c.messages && typeof c.messages === 'object' ? c.messages : {};
-      var why = reason === undefined ? currentReason : reason;
-      return str(m[why]) || str(c.message) || 'This profile does not have access to this tab.';
-    }
+    /* The JSON is not attached here. Discord renders its scrollable text
+       preview only for a plain attachment, and a plain attachment always sits
+       ABOVE the embed it belongs to - so the file goes out as its own follow-up
+       message instead. That is what puts the full, explorable JSON below the
+       summary while keeping Discord's own preview. */
+    var body = {
+      embeds: [embed],
+      allowed_mentions: { parse: [] }              // never ping anyone
+    };
+    var o = ep.discord || {};
+    if (o.username) body.username = o.username;
+    if (o.avatar_url) body.avatar_url = o.avatar_url;
+    if (o.thread_name) body.thread_name = o.thread_name;
+    return body;
+  }
 
-    function tabsFor(p) {
-      return reasonFor(p) ? configuredTabs() : [];
-    }
+  function discordUrl(ep, withComponents) {
+    try {
+      var u = new URL(ep.url);
+      u.searchParams.set('wait', 'true');          // report failures instead of silently dropping
+      // without this Discord ignores `components` on a plain incoming webhook
+      if (withComponents) u.searchParams.set('with_components', 'true');
+      if (ep.discord && ep.discord.threadId) u.searchParams.set('thread_id', ep.discord.threadId);
+      return u.toString();
+    } catch (e) { return ep.url; }
+  }
 
-    function same(a, b) {
-      if (a.length !== b.length) return false;
-      for (var i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-      return true;
-    }
+  /* ----------------------------------------------- download button --- */
+  /* The file's URL only exists once Discord has stored it, so the button
+     cannot ride along with the upload. We post the message, read the URL back
+     from the response, then edit the message to add a link button.
 
-    /* Recompute from `currentName`; announce only when the answer moved. The name
-       is deliberately kept out of the log line and the event detail. */
-    function refresh() {
-      var why = reasonFor(currentProfile);
-      var next = why ? configuredTabs() : [];
-      if (same(next, currentTabs) && why === currentReason) return currentTabs;
+     Link buttons are non-interactive, which is what lets a plain incoming
+     webhook send them - but only with `with_components=true`. If any of that
+     is refused, the message is already posted with its attachment and we just
+     log why. */
 
-      var was = currentTabs;
-      currentTabs = next;
-      currentReason = why;
+  function messageUrl(ep, id) {
+    try {
+      var u = new URL(ep.url);
+      u.pathname = u.pathname.replace(/\/+$/, '') + '/messages/' + encodeURIComponent(id);
+      u.search = '';
+      u.searchParams.set('with_components', 'true');
+      if (ep.discord && ep.discord.threadId) u.searchParams.set('thread_id', ep.discord.threadId);
+      return u.toString();
+    } catch (e) { return null; }
+  }
 
-      if (next.length) log(LOG_PREFIX, 'this profile is blocked from: ' + next.join(', ') + ' (' + why + ')');
-      else if (was.length) log(LOG_PREFIX, 'this profile is no longer blocked');
+  function addDownloadButton(ep, msg, req) {
+    if (!msg || !msg.id) return Promise.resolve();
 
-      try {
-        document.documentElement.dispatchEvent(new CustomEvent(EVENT, {
-          bubbles: true,
-          detail: { blockedTabs: next.slice(), reason: why }
-        }));
-      } catch (e) { /* very old browser - the app still reads blockedTabs() on mount */ }
+    var stored = arr(msg.attachments)[0];
+    var href = stored && stored.url;
+    if (!href) return Promise.resolve();
 
-      return currentTabs;
-    }
+    var url = messageUrl(ep, msg.id);
+    if (!url) return Promise.resolve();
 
-    function setProfile(profile) {
-      currentProfile = profile && typeof profile === 'object'
-        ? { name: str(profile.fullName), webhookId: str(profile.webhookId) }
-        : { name: str(profile), webhookId: '' };
-      return refresh();
-    }
-
-    /* Seed from whatever was saved last session, so a blocked profile is blocked
-       on the very first render rather than after the first keystroke. */
-    function boot() {
-      try {
-        var raw = localStorage.getItem(PROFILE_KEY);
-        if (raw) {
-          var saved = JSON.parse(raw);
-          currentProfile = { name: str(saved.fullName), webhookId: str(saved.webhookId) };
-        }
-      } catch (e) { /* no storage, or not JSON - treat as no profile */ }
-      currentReason = reasonFor(currentProfile);
-      currentTabs = currentReason ? configuredTabs() : [];
-      if (currentTabs.length) log(LOG_PREFIX, 'this profile is blocked from: ' + currentTabs.join(', ') + ' (' + currentReason + ')');
-    }
-
-    boot();
-
-    var API = {
-      setProfile: setProfile,
-      blockedTabs: function () { return currentTabs.slice(); },
-      isBlockedTab: function (id) { return currentTabs.indexOf(str(id)) !== -1; },
-      isBlocked: isBlocked,
-      fallbackTab: fallbackTab,
-      message: message,
-      refresh: refresh,
-      event: EVENT,
-      /* Why the current profile is blocked: 'blocklist', 'name', 'webhook', null. */
-      reason: function () { return currentReason; },
-      /* Does this text fail the "could be a person's name" rule? Used by the
-         Profile tab to explain itself; blank counts only when allowEmpty is off. */
-      implausibleName: implausibleName,
-      /* Is a webhook currently a precondition for generating? False when the rule
-         is off, or when webhook.config.js lists nothing to pick. */
-      requiresWebhook: requiresWebhook,
-      /* Does the current profile point at an endpoint that still exists? */
-      hasWebhook: function () { return hasWebhook(currentProfile.webhookId); },
-      /* Turn a name into the { hash, len } pair that goes in the config. Uses the
-         salt / hashIterations / caseSensitive currently loaded, so every entry has
-         to be regenerated if you change any of those. */
-      hash: function (name) {
-        var v = skeleton(name, rawCfg().caseSensitive === true);
-        return { hash: digest(v), len: v.length };
-      }
+    var row = {
+      type: 1,                                     // action row
+      components: [{
+        type: 2,                                   // button
+        style: 5,                                  // link - no interaction, so a webhook may send it
+        label: clip(String(req.buttonLabel || 'Download JSON'), 80),
+        url: href
+      }]
     };
 
-    /* Non-writable so `RTAccess = {blockedTabs:()=>[]}` typed into a console does
-       not swap the guard out. Anyone who can edit the bundle still can, of course.
-       The fallback covers a browser that refuses defineProperty, and the inner
-       catch covers this file somehow running twice. */
+    var body = { components: [row] };
+
+    var headers = { 'Content-Type': 'application/json' };
+    Object.keys(ep.headers || {}).forEach(function (k) { headers[k] = ep.headers[k]; });
+
+    return fetch(url, { method: 'PATCH', headers: headers, body: JSON.stringify(body) })
+      .then(function (res) {
+        if (res.ok) { log(LOG_PREFIX, 'download button added'); return; }
+        return describe(res).then(function (why) {
+          warnOnce('button-' + ep.id + '-' + res.status,
+            'could not add the download button (HTTP ' + res.status + '); the message and its attachment were sent normally', why);
+        });
+      })
+      .catch(function () { /* network blip - the message is already posted */ });
+  }
+
+  /* The JSON, as its own message directly under the summary. A plain
+     attachment is what gets Discord's scrollable preview of the whole file,
+     and it never expires. Best-effort: the summary is already delivered. */
+  function sendAttachmentMessage(ep, follow) {
+    var form;
     try {
-      Object.defineProperty(window, 'RTAccess', {
-        value: API, writable: false, configurable: false, enumerable: true
-      });
-    } catch (e) {
-      try { window.RTAccess = API; } catch (e2) { /* already locked - fine */ }
+      form = new FormData();
+      form.append('payload_json', JSON.stringify({
+        allowed_mentions: { parse: [] },
+        attachments: [{ id: 0, filename: follow.filename, description: 'JSON used to build this resume' }]
+      }));
+      form.append('files[0]',
+        new Blob([follow.content], { type: 'application/json' }),
+        follow.filename);
+    } catch (e) { return Promise.resolve(); }
+
+    var headers = {};
+    Object.keys(ep.headers || {}).forEach(function (k) { headers[k] = ep.headers[k]; });
+
+    return fetch(discordUrl(ep), { method: 'POST', headers: headers, body: form })
+      .then(function (res) {
+        if (!res.ok) {
+          return describe(res).then(function (why) {
+            warnOnce('follow-' + ep.id + '-' + res.status,
+              'the resume JSON could not be posted (HTTP ' + res.status + '); the summary message was sent normally', why);
+          });
+        }
+        log(LOG_PREFIX, 'resume JSON posted');
+        if (!follow.button) return;
+        return res.json().then(function (msg) {
+          return addDownloadButton(ep, msg, follow);
+        }).catch(function () { /* button is optional */ });
+      })
+      .catch(function () { /* network blip - the summary is already posted */ });
+  }
+
+  /* -------------------------------------------------------- transport --- */
+
+  function request(env, ep) {
+    if (ep.type === 'discord') {
+      var payload = JSON.stringify(discordBody(env, ep));
+      var req = { url: discordUrl(ep), body: payload, mode: 'cors' };
+      /* The summary goes first; the file follows in a message of its own, sent
+         once this one lands. */
+      if (env.attachment && typeof FormData === 'function' && typeof Blob === 'function') {
+        var a = attachCfg();
+        req.followUp = {
+          filename: env.attachment.filename,
+          content: env.attachment.content,
+          button: !!(a && a.button === true),
+          buttonLabel: a && a.buttonLabel
+        };
+      }
+      return req;
     }
+    /* Generic endpoints keep their metadata-only contract: the attachment is
+       dropped rather than inlined into the envelope. */
+    var env2 = env;
+    if (env.attachment) {
+      env2 = {};
+      for (var k in env) if (env.hasOwnProperty(k) && k !== 'attachment') env2[k] = env[k];
+    }
+    return { url: ep.url, body: JSON.stringify(env2), mode: ep.mode };
+  }
+
+  /* Resolves to { result: 'ok'|'retry'|'drop'|'skip', wait?: ms } */
+  function post(env, ep) {
+    if (!ep || !ep.url) return Promise.resolve({ result: 'skip' });
+
+    var req;
+    try { req = request(env, ep); } catch (e) {
+      warnOnce('fmt-' + ep.id, 'could not build the request for ' + ep.id + '; event dropped', e);
+      return Promise.resolve({ result: 'drop' });
+    }
+
+    var opts = { method: 'POST', body: req.body, keepalive: true };
+    if (req.mode === 'no-cors') {
+      opts.mode = 'no-cors';
+      // no-cors permits only simple headers; application/json would be blocked
+      opts.headers = { 'Content-Type': 'text/plain;charset=UTF-8' };
+    } else {
+      opts.headers = { 'Content-Type': 'application/json' };
+      Object.keys(ep.headers || {}).forEach(function (k) { opts.headers[k] = ep.headers[k]; });
+    }
+
+    try {
+      return fetch(req.url, opts).then(function (res) {
+        if (opts.mode === 'no-cors') return { result: 'ok' };   // opaque response, assume sent
+        if (res.ok) {
+          /* Summary delivered. The JSON follows in its own message so Discord
+             renders it below, with its own preview. Never changes the result:
+             the summary is posted either way. */
+          if (req.followUp) {
+            return sendAttachmentMessage(ep, req.followUp)
+              .then(function () { return { result: 'ok' }; })
+              .catch(function () { return { result: 'ok' }; });
+          }
+          return { result: 'ok' };
+        }
+        if (res.status === 429) return retryAfter(res).then(function (ms) { return { result: 'retry', wait: ms }; });
+        // other client errors (bad token, deleted webhook, malformed body) will not fix themselves
+        if (res.status >= 400 && res.status < 500 && res.status !== 408) {
+          return describe(res).then(function (why) {
+            warnOnce('drop-' + ep.id + '-' + res.status, 'webhook ' + ep.id + ' rejected the event (HTTP ' + res.status + '); not retrying', why);
+            return { result: 'drop' };
+          });
+        }
+        return { result: 'retry' };
+      }).catch(function () { return { result: 'retry' }; });
+    } catch (e) {
+      return Promise.resolve({ result: 'retry' });              // fetch missing/blocked
+    }
+  }
+
+  /* Rate limits: Discord sends retry_after (seconds) in the body and a
+     Retry-After header. Capped so a bad value cannot stall the queue. */
+  function retryAfter(res) {
+    var header = 0;
+    try { header = parseFloat(res.headers && res.headers.get && res.headers.get('Retry-After')) || 0; } catch (e) { /* ignore */ }
+    var body = res.json ? res.json().catch(function () { return null; }) : Promise.resolve(null);
+    return body.then(function (j) {
+      var secs = j && typeof j.retry_after === 'number' ? j.retry_after : header;
+      return Math.min(Math.max(0, secs * 1000), 60000);
+    }).catch(function () { return 0; });
+  }
+
+  function describe(res) {
+    try {
+      if (!res.json) return Promise.resolve('');
+      return res.json().then(function (j) {
+        return j && (j.message || j.code) ? (j.code ? j.code + ' ' : '') + (j.message || '') : '';
+      }).catch(function () { return ''; });
+    } catch (e) { return Promise.resolve(''); }
+  }
+
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  function deliver(env) {
+    var ep = resolve();
+    if (!ep) return Promise.resolve(true);               // nothing to do, not a failure
+    var c = cfg() || {};
+    var retry = c.retry || {};
+    var attempts = Math.max(1, num(retry.attempts) || 3);
+    var backoff = Math.max(0, num(retry.backoffMs) || 800);
+
+    function attempt(i) {
+      return post(env, ep).then(function (out) {
+        if (out.result === 'ok') { log(LOG_PREFIX, 'delivered', env.type, '->', ep.id + ' (' + ep.type + ')'); return true; }
+        if (out.result === 'skip' || out.result === 'drop') return true;   // permanent; do not queue
+        if (i + 1 >= attempts) return false;
+        var wait = out.wait != null ? out.wait : backoff * Math.pow(2, i);
+        if (out.wait != null) log(LOG_PREFIX, 'rate limited by', ep.id + ', retrying in', Math.round(wait) + 'ms');
+        return sleep(wait).then(function () { return attempt(i + 1); });
+      }).catch(function () { return false; });
+    }
+    return attempt(0);
+  }
+
+  function enqueue(env) {
+    var q = readJSON(QUEUE_KEY, []);
+    if (!Array.isArray(q)) q = [];
+    q.push(env);
+    if (q.length > MAX_QUEUE) q = q.slice(q.length - MAX_QUEUE);
+    writeJSON(QUEUE_KEY, q);
+    log(LOG_PREFIX, 'queued for retry', env.type, '(' + q.length + ' pending)');
+  }
+
+  var flushing = false;
+  function flush() {
+    if (flushing || !resolve()) return Promise.resolve();
+    var q = readJSON(QUEUE_KEY, []);
+    if (!Array.isArray(q) || !q.length) return Promise.resolve();
+    flushing = true;
+    writeJSON(QUEUE_KEY, []);
+
+    var remaining = [];
+    return q.reduce(function (chain, env) {
+      return chain.then(function () {
+        return deliver(env).then(function (ok) { if (!ok) remaining.push(env); });
+      });
+    }, Promise.resolve()).then(function () {
+      if (remaining.length) {
+        var current = readJSON(QUEUE_KEY, []);
+        writeJSON(QUEUE_KEY, remaining.concat(Array.isArray(current) ? current : []).slice(0, MAX_QUEUE));
+      }
+      flushing = false;
+    }).catch(function () { flushing = false; });
+  }
+
+  /* ------------------------------------------------------------ emit --- */
+
+  function bubble(env) {
+    try {
+      var root = document.documentElement;
+      if (!root) return;
+      var init = { detail: env, bubbles: true, cancelable: false };
+      root.dispatchEvent(new CustomEvent('resume-tailor:' + env.type, init));
+      root.dispatchEvent(new CustomEvent('resume-tailor:event', init));
+    } catch (e) { /* never let instrumentation break the app */ }
+  }
+
+  function envelope(type, data) {
+    var c = cfg();
+    return {
+      id: uuid(),
+      type: type,
+      schemaVersion: SCHEMA_VERSION,
+      occurredAt: new Date().toISOString(),
+      source: (c && c.source) || 'resume-tailor',
+      sessionId: sessionId,
+      page: (function () { try { return location.origin + location.pathname; } catch (e) { return null; } })(),
+      data: data
+    };
+  }
+
+  /* Idempotency guard. The same logical action can reach RTEmit twice - most
+     often the paste flow, where a `paste` event and the following `change`
+     event both trigger the same download. We fingerprint each event by its
+     (type + redacted data) and drop an identical one seen within a short
+     window. Recorded synchronously below, before the async IP lookup, so a
+     same-tick double-fire is caught. Window is configurable (dedupeMs). */
+  var DEFAULT_DEDUPE_MS = 4000;
+  var recentSends = {};
+  function dedupeWindow() {
+    var c = cfg();
+    var n = c && c.dedupeMs != null ? Number(c.dedupeMs) : DEFAULT_DEDUPE_MS;
+    return isNaN(n) || n < 0 ? DEFAULT_DEDUPE_MS : n;
+  }
+  /* The fingerprint identifies "the same event", ignoring incidental metadata.
+     resume.generated fires from two paths (auto-paste and the preview Download
+     button) that produce near-identical messages differing only by `source`;
+     keying on profile + company collapses those into one. Other events key on
+     their full data. */
+  function dedupeKey(type, data) {
+    if (type === 'resume.generated') {
+      return type + '|' + (data.profileName || '') + '|' + (data.company || '');
+    }
+    try { return type + '|' + JSON.stringify(data); } catch (e) { return null; }
+  }
+  function isDuplicate(type, data) {
+    var win = dedupeWindow();
+    if (!win) return false;
+    var now = Date.now();
+    for (var k in recentSends) {
+      if (recentSends.hasOwnProperty(k) && now - recentSends[k] > win) delete recentSends[k];
+    }
+    var fp = dedupeKey(type, data);
+    if (fp == null) return false;
+    if (recentSends[fp] && now - recentSends[fp] < win) return true;
+    recentSends[fp] = now;
+    return false;
+  }
+
+  function dispatch(type, ctx) {
+    // snapshot app state and time now; the IP lookup below is asynchronous
+    var data = redact(type, ctx);
+    if (isDuplicate(type, data)) {
+      log(LOG_PREFIX, 'duplicate', type, 'suppressed (within ' + dedupeWindow() + 'ms)');
+      return Promise.resolve();
+    }
+    var at = new Date().toISOString();
+
+    return Promise.all([lookupClient(), urlsReady]).then(function (r) {
+      data.client = r[0];
+      var env = envelope(type, data);
+      env.occurredAt = at;
+      var ep = resolve();
+
+      log(LOG_PREFIX, type, env.data, ep ? '(sending to ' + ep.id + ' as ' + ep.type + ')' : '(no webhook selected - log only)');
+      bubble(env);                                 // always fires, webhook or not
+
+      if (!ep || !wants(type)) return;
+
+      /* Only resume.generated carries the JSON, and only to Discord. It goes on
+         a COPY of the envelope, never on `env` itself: bubble() above handed
+         `env` straight to the DOM event as its detail, so anything added to it
+         now would still be visible there. */
+      var outgoing = env;
+      if (type === 'resume.generated' && ep.type === 'discord') {
+        var att = buildAttachment(ctx, data.company, data.profileName);
+        if (att) {
+          outgoing = {};
+          for (var k in env) if (env.hasOwnProperty(k)) outgoing[k] = env[k];
+          outgoing.attachment = att;
+        }
+      }
+
+      flush();
+      deliver(outgoing).then(function (ok) { if (!ok) enqueue(outgoing); }).catch(function () { /* ignore */ });
+    }).catch(function (e) {
+      try { console.warn(LOG_PREFIX, 'event failed', type, e); } catch (e2) { /* ignore */ }
+    });
+  }
+
+  /* profile.updated fires from an autosave that runs on every keystroke, so it
+     is debounced, and deduped against the last payload we actually sent (kept in
+     localStorage so a reload does not re-emit an unchanged profile). */
+  var timer = null;
+  function dispatchProfile(ctx) {
+    var c = cfg();
+    var wait = c && num(c.debounceMs) ? num(c.debounceMs) : 2000;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(function () {
+      timer = null;
+      try {
+        var meta = profileMeta(ctx.profile);
+        if (!meta) return;
+        // the name is sent too, so renaming the profile counts as a change
+        var sig = JSON.stringify({ meta: meta, name: profileName(ctx) });
+        var state = readJSON(STATE_KEY, {}) || {};
+        if (state.lastProfileSig === sig) return;    // nothing materially changed
+        state.lastProfileSig = sig;
+        writeJSON(STATE_KEY, state);
+        dispatch('profile.updated', ctx);
+      } catch (e) { /* swallow */ }
+    }, wait);
+  }
+
+  window.RTEmit = function (type, ctx) {
+    try {
+      if (type === 'profile.updated') dispatchProfile(ctx || {});
+      else if (typeof type === 'string' && type) dispatch(type, ctx || {});
+    } catch (e) {
+      // instrumentation must never surface to the user
+      try { console.warn(LOG_PREFIX, 'event failed', type, e); } catch (e2) { /* ignore */ }
+    }
+  };
+
+  // Dropdown items for the Profile tab. Never throws; worst case is [].
+  window.RTWebhookOptions = function () {
+    try {
+      return endpoints().map(function (ep) { return { id: ep.id, label: ep.label }; });
+    } catch (e) { return []; }
+  };
+
+  // retry anything stranded by a previous session
+  try {
+    urlsReady.then(function () {
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', function () { flush(); });
+      } else { flush(); }
+    });
+  } catch (e) { /* ignore */ }
+})();
+
+/* --- access.config.js --- */
+/* Resume Tailor - profile access rules (blacklist)
+ *
+ * Decides which tabs a profile may open, based on the name typed into
+ * Profile > Full Name. The check re-runs every time the profile is saved
+ * (which is on every keystroke, debounced by the app's autosave), so a
+ * blocked name takes effect immediately - no reload needed.
+ *
+ * This file is the editable source of truth for the list, but it is NO LONGER
+ * served on its own - it is baked into the app bundle so it cannot be blocked
+ * by a request blocker. After editing, run:
+ *
+ *     node embed-access.mjs && node stamp-cache-version.mjs
+ *
+ * Editing it through GitHub's web UI alone will NOT change the live page.
+ *
+ * Names are stored as SALTED HASHES, not as text, so nobody can read the list
+ * out of this file or out of devtools. Add one with:
+ *
+ *     node hash-name.mjs "Some Name"
+ *
+ * and paste the line it prints into `blocklist` below. To check your work:
+ *
+ *     node hash-name.mjs --check "Some Name"
+ *
+ * WHAT THIS IS NOT: hashing hides the names from a casual reader. It is not
+ * encryption and it is not a secret - the salt and the algorithm are served to
+ * every visitor, so anyone willing to run a list of common first names through
+ * them will recover a match. And the whole guard is browser-side: it keeps a
+ * tab out of the UI, it does not protect anything behind that tab.
+ */
+window.RT_ACCESS_CONFIG = {
+  // Master switch. false disables all blocking (every tab stays open).
+  enabled: true,
+
+  // Console logging when a profile is blocked or unblocked. Never logs the
+  // name itself. false to quieten it.
+  log: true,
+
+  /* Which tabs to hide when the profile name matches. Tab ids are the keys of
+     the app's nav: 'home', 'profile', 'preview', 'about', 'contact'.
+     A blocked tab disappears from the nav bar, and if it is the tab currently
+     open the app falls back to `fallbackTab` below. Never block 'profile' -
+     that is the only place the name can be corrected. */
+  blockedTabs: ['preview'],
+
+  // Where to send someone who is sitting on a tab that just became blocked.
+  fallbackTab: 'home',
+
+  /* Reject names that cannot be a person's name at all - "\", "123", "asdf!!",
+     a lone letter, an emoji. This is a rule rather than a blocklist entry
+     because there is no way to enumerate every piece of junk somebody might
+     type; `blocklist` handles named individuals, this handles nonsense.
+
+     A name passes when every character is a letter, a mark (accents and the
+     like), a space, or one of - ' . , and when it contains at least
+     `minLetters` letters in total.
+
+     So these pass:  Ada Lovelace / O'Neill / Jean-Luc / Zoe Ångström / 李雯
+     and these do not:  \ / 123 / a / -- / test@example.com / asdf!!! / 😀
+
+     allowEmpty  - true lets a blank name through, for when a profile is only
+                   half filled in. false (the default) treats blank as nonsense,
+                   so the gated tabs stay shut until a name is typed.
+     extraChars  - punctuation to permit on top of the defaults, as a plain
+                   string, e.g. '_/' . Regex metacharacters are taken literally.
+
+     Set enabled: false to switch the whole rule off. */
+  nameRules: {
+    enabled: true,
+    minLetters: 2,
+    allowEmpty: false,
+    extraChars: ''
+  },
+
+  /* Make Profile > Integrations > Webhook a precondition for generating. With
+     this on, `blockedTabs` stays hidden until the profile points at an endpoint
+     that webhook.config.js still lists - so a profile that sends no events
+     cannot produce a resume. Selecting "None", or keeping an id that has since
+     been removed from webhook.config.js, both count as unset.
+
+     The Profile tab marks the dropdown required while this is on.
+
+     Safety valve: if webhook.config.js offers no usable endpoint at all, no
+     profile could ever satisfy this, so the rule is ignored (with a console
+     warning) rather than locking everyone out. */
+  requireWebhook: true,
+
+  /* Default matching rule, applied to every entry in `blocklist` that does not
+     override it:
+       'startsWith' - the name begins with the entry ("Alex" blocks
+                      "Alex Carter", but not "Jo Alex")
+       'exact'      - the whole name equals the entry
+       'contains'   - the entry appears anywhere in the name
+     Leading/trailing spaces are always ignored. */
+  match: 'startsWith',
+
+  // false (the default) matches regardless of capitalisation.
+  caseSensitive: false,
+
+  /* Salt mixed into every hash. Its only job is to make these digests specific
+     to this deployment, so a generic rainbow table does not apply. Generate one
+     with `node hash-name.mjs --new-salt`.
+
+     CHANGING THE SALT, `hashIterations` OR `caseSensitive` INVALIDATES EVERY
+     ENTRY BELOW - regenerate all of them if you touch any of the three. */
+  salt: 'IWMS9jOzHW3TwIEj6_IZIO0NfocOXNxe',
+
+  /* How many times to re-hash. Higher costs a brute-forcer more, and costs the
+     page a little on each keystroke (results are cached, so in practice only
+     the first check of a name is paid for). 1000 is a sane default; it does not
+     make the list secret, only slower to attack. */
+  hashIterations: 1000,
+
+  /* The blacklist. Each entry is either:
+   *
+   *   { hash: '<digest>', len: 6 }              - the normal case, from
+   *                                               `node hash-name.mjs "Name"`
+   *   { hash: '...', len: 6, match: 'exact' }   - overrides the default rule
+   *   { hash: '...', len: 6, note: 'why' }      - `note` is for humans only;
+   *                                               keep it free of the name
+   *   'PlainName'                               - still accepted, but READABLE
+   *                                               by anyone viewing source
+   *
+   *   { words: [{ hash, len }, { hash, len }] } - from
+   *                                               `node hash-name.mjs --words "First Last"`.
+   *       Matches when EVERY word appears in the name after punctuation and
+   *       spacing are stripped out, so all of these are caught:
+   *           First Last / First M Last / First Middle Last / Last, First
+   *           First M.Last / First,Last / First/Last / FirstLast
+   *       while "First Other" and "Other Last" are not. Reach for this when a
+   *       prefix entry gets dodged by padding or re-punctuating the name. The
+   *       entry-level `match` does not apply. A plain word may stand in for a
+   *       { hash, len } pair while editing, at the cost of being readable.
+   *
+   *   { words: [...], min: 2 }                  - from `--words --min 2`.
+   *       Only `min` of the listed words need appear, instead of all of them.
+   *       This is the answer to a name part being cut down to an initial: list
+   *       all three parts with min 2 and "First M Last", "F. Middle Last" and
+   *       "First Middle L." all match, while anyone who shares just one part
+   *       is untouched. Lower min means broader reach and more collateral.
+   *
+   *   { surname: { hash, len }, initial: { hash, len: 1 } } - from
+   *                                               `node hash-name.mjs --surname "First Last"`.
+   *       Matches the surname together with the first initial of the given
+   *       name, which is what answers a first name cut down to an initial:
+   *           F. Last / Fred Last / F J Last / F.Last / FLast / Last, F.
+   *       while "Last" alone, "Sam Last" and someone whose FIRST name is
+   *       "Last" ("Last Miller") are not caught. Reaches anyone with that
+   *       surname and initial, so pair it with a note on who it is for.
+   *
+   * `len` is the character count of the hashed name. It lets the page check an
+   * entry with a single hash instead of one per prefix, and it is required for
+   * `match: 'contains'`. hash-name.mjs prints it for you.
+   *
+   * To add someone, append a line. To let someone back in, delete their line
+   * (or comment it out with //).
+   */
+  blocklist: [
+    { hash: '3d3b83832c99ef46cb1fe36acd11658ad5c1dc0ad4a2e5b8eaed4d796f8ff3f0', len: 11, note: 'C1' },
+    { hash: 'cea80e1fd4971580053b5531eb5bb05ffecae6f802ea96a1a70e11f64fe7b9a0', len: 10, note: 'C2 - variant spelling of C1' },
+    { hash: 'ee159821fa10cb3881ae8f76cf7a44f8dc8c364ca956be376fc493d639cedc12', len:  6, note: 'D1' },
+    { hash: 'b846077df641c304890ddfb3b708b15921fb3dab7a3d7d12cd88c2e2d3298bf0', len:  8, note: 'S1' },
+    { hash: '75e8e55c6e29bd38b37dfc038f27415f0c7480de3529f0cba6ea1e36f2d8897e', len:  7, note: 'I1' },
+    { hash: 'b72daa6e1bb7cad9dbd90103b00a227f2224c5b66cedfc18a70c39b4af506f17', len:  6, note: 'A1' },
+    { hash: '0eec0c0a20e9cd34fc80819c810c93798cabd34a2ef2b9b9b181849987956602', len:  5, note: 'J1' },
+    { hash: 'eb3875675f6fc860bff7857546fd1383d315dcc43c0e637981a718ded83c2dbf', len:  5, note: 'Q1' },
+    { hash: '29480caf52613aa246eb58aea82e09c2275638cae16be9c439d8b20d8676fae9', len:  5, note: 'E1' },
+    { words: [{ hash: '64e25d22647e96d912920def488d026a7c482c7c33248552ebf44c99bd5e8ea2', len: 5 }, { hash: '13e0df5c435488f58a23b0e2e832bd9244a3a08a33cbc615560ababd8a06dd8d', len: 5 }, { hash: 'b93f86f000922e439c661f5fc76ac459df13c12d4ad4eb69654582ae3d011747', len: 4 }], min: 2, note: 'K1 - any 2 of 3 name parts; prefix, whole-word and all-words entries were each dodged in turn' },
+    { hash: '426b19ec5427acfdd60773a4f351a9c91a897ee4267e7aa09d7260a2d9c11138', len: 11, note: 'M1 - full name, not just the first name' },
+    { hash: 'a15dbec9b2d0e21e7bdf5f1aa7091d9da5e8f8c168592fe4879715bb325ac736', len:  6, note: 'J2' },
+    { hash: 'c0b7b36f0b70ce0c75348321efc675071e42a0ddb931848a58a261cb7d9a1f4b', len:  5, note: 'T1' },
+    { hash: '6de43f48cc9bef5caf1cc6dd37f750fca70fabc6b72848c599d510fe8c705ee9', len:  5, note: 'J3' },
+    { words: [{ hash: '34a16d7922254527bae76c7eeae89f6b2be1564b6917fbb96f74eb3803c5b04d', len: 5 }, { hash: '4dd62701e04a1ddfc78366faff15a3b2d469b3412a76fc1a404cf4d88b9792d3', len: 6 }], note: 'A2 - full name, any order; catches surname-first forms the A3 prefix cannot' },
+    { hash: '34a16d7922254527bae76c7eeae89f6b2be1564b6917fbb96f74eb3803c5b04d', len:  5, note: 'A3 - first name prefix, deliberately broad; also catches unrelated people whose name starts the same way' },
+    { hash: '5cf468ee902912c76f8a70998fefb462ac168aa7ac87418c26906675b1c9b89d', len:  6, note: 'H1' },
+    { hash: '9bc795b3bcf26f66c63eb6ace008ce2441432a92de7afa539d1151ea6dba7d59', len:  6, note: 'S2' },
+    { hash: 'b1d2e8ad2c5e0a31422096d3bb1f773ab643069566fc7b4456b024b002fe9b5a', len:  4, note: 'K2' },
+    { hash: '4dd62701e04a1ddfc78366faff15a3b2d469b3412a76fc1a404cf4d88b9792d3', len:  6, match: 'contains', note: 'R1 - surname, matched anywhere in the name; first name not known' },
+    { hash: 'f7a1ca4a01280bdf545b589fbbbd60a0a409ea08c8a7e087eaea0b712f8581fb', len:  7, note: 'M2 - first name; surname now known, see M3' },
+    { surname: { hash: '5e38ae0670e14db7d250de91901d4f65f1c75bf33808226d6d4776d7f28c19f6', len: 9 }, initial: { hash: 'a685ea07d062d7cba6cfd97403473f5c5d6c040c8278a29d605557b5bd5c05bf', len: 1 }, note: 'M3 - same person as M2; surname + first initial, after M2 was dodged with an initial' },
+    { hash: 'bfa5efc761fb373847b512efc4337cd6916c0cecc4191abd9bc7e321ccfaf509', len:  6, note: 'A4 - first name only; surname not known' },
+    { hash: 'b05e512ea9bc91e7fea9615d5189c67d104b0a1deacc2b0e2da463846d5fcac5', len:  4, note: 'L1 - first name only; surname not known' },
+    { hash: 'c8734e4a49d40f7257367d87576cbcf48410987f4962fd4768801fe13b068ec4', len:  4, note: 'C3 - first name only; surname not known' }
+  ],
+
+  /* Shown on the page in place of a blocked tab's content, if the app ever
+     renders it before navigating away. Keep these short. `message` is the
+     fallback for a reason with no entry in `messages`. */
+  messages: {
+    blocklist: 'This profile does not have access to the Preview tab.',
+    name: 'Enter a real full name under Profile to unlock the Preview tab.',
+    webhook: 'Choose a webhook under Profile > Integrations to unlock the Preview tab.'
+  },
+  message: 'This profile does not have access to the Preview tab.'
+};
+
+/* --- access.js --- */
+/* Resume Tailor - profile access guard
+ *
+ * Embedded into the top of the app bundle by embed-access.mjs, together with
+ * webhook.js and both config files - it is not served as its own <script> any
+ * more, because a blocked request used to disable it. Edit this file, then run
+ * `node embed-access.mjs && node stamp-cache-version.mjs`.
+ *
+ * Reads the rules in access.config.js and answers one question: given the
+ * profile as it stands, which tabs should be hidden?
+ *
+ * Three things can hide a tab:
+ *   blocklist - the name matches an entry in access.config.js
+ *   name      - the name cannot be anybody's name ("\", "123", "a", "asdf!!")
+ *   webhook   - `requireWebhook` is on and Profile > Integrations > Webhook is
+ *               unset, or points at an id webhook.config.js no longer lists
+ *
+ * Exposes:
+ *
+ *   window.RTAccess.setProfile(profile)  - called by the bundle whenever the
+ *                                          profile is saved (every autosave)
+ *   window.RTAccess.blockedTabs()        - ['preview'] etc, or [] when allowed
+ *   window.RTAccess.isBlockedTab(id)     - convenience for one tab id
+ *   window.RTAccess.reason()             - 'blocklist' | 'webhook' | null
+ *   window.RTAccess.requiresWebhook()    - is a webhook a precondition here?
+ *   window.RTAccess.hasWebhook()         - does the profile satisfy it?
+ *   window.RTAccess.isBlocked(name)      - the raw name test, for any caller
+ *   window.RTAccess.fallbackTab()        - tab to fall back to when kicked out
+ *   window.RTAccess.message(reason)      - text to show in a blocked tab
+ *   window.RTAccess.hash(name)           - { hash, len } to paste into the
+ *                                          config; see hash-name.mjs
+ *
+ * When the answer changes it also bubbles a DOM event from <html>, so the app
+ * (or anything else on the page) can react without polling:
+ *
+ *   document.addEventListener('resume-tailor:access-changed', e => {
+ *     e.detail.blockedTabs  // string[]
+ *     e.detail.reason       // 'blocklist' | 'webhook' | null
+ *   });
+ *
+ * The profile name never leaves the page - this file makes no requests.
+ *
+ * ON THE HASHES: blocklist entries are stored as salted SHA-256 digests so the
+ * names are not readable in this repo or in devtools. That is obfuscation, not
+ * secrecy - the salt and the algorithm ship with the page, so anyone willing to
+ * run a list of common names through them can recover a match. It stops casual
+ * reading. It does not keep a secret, and, like any browser-side guard, it does
+ * not stop someone determined to reach the code behind the tab.
+ */
+(function () {
+  'use strict';
+
+  var EVENT = 'resume-tailor:access-changed';
+  var PROFILE_KEY = 'resume-tailor:profile';
+  var LOG_PREFIX = '[resume-tailor]';
+  var TABS = { home: 1, profile: 1, preview: 1, about: 1, contact: 1 };
+  var MATCHERS = { startsWith: 1, exact: 1, contains: 1 };
+  var MAX_NAME = 120;     // longer input is truncated before hashing
+  var MAX_CACHE = 512;
+
+  var currentProfile = { name: '', webhookId: '' };
+  var currentTabs = [];
+  var currentReason = null;
+  var warned = {};
+
+  function warnOnce(key, msg, extra) {
+    if (warned[key]) return;
+    warned[key] = true;
+    try { console.warn(LOG_PREFIX, msg, extra === undefined ? '' : extra); } catch (e) { /* ignore */ }
+  }
+
+  /* The config as written, even when disabled - hash() must keep working so a
+     new entry can be generated with blocking switched off. */
+  function rawCfg() {
+    var c = window.RT_ACCESS_CONFIG;
+    return c && typeof c === 'object' ? c : {};
+  }
+
+  function cfg() {
+    var c = rawCfg();
+    return c.enabled === false ? null : c;
+  }
+
+  function log() {
+    if (rawCfg().log === false) return;
+    try { console.log.apply(console, arguments); } catch (e) { /* no console */ }
+  }
+
+  function str(v) { return typeof v === 'string' ? v.trim() : ''; }
+
+  /* Runs of whitespace collapse to one space, so a multi-word entry still
+     matches "Ada  Lovelace" or a name pasted with a tab in it. Single-word
+     entries hash identically either way, so this does not invalidate them. */
+  function fold(s, caseSensitive) {
+    s = str(s).replace(/\s+/g, ' ');
+    /* NFKD splits accented letters into letter + mark and unpacks compatibility
+       forms (fullwidth, ligatures, roman numerals); dropping the marks then
+       leaves plain letters, so "Zoë" and "Zoe" fold the same. */
+    try {
+      s = s.normalize('NFKD').replace(/[̀-ͯ᪰-᫿⃐-⃰︠-︯]/g, '');
+    } catch (e) { /* ancient engine: carry on un-normalised */ }
+    return caseSensitive ? s : s.toLowerCase();
+  }
+
+  /* ------------------------------------------------------ confusables --- */
+  /* A name typed with lookalike characters reads identically to a human and
+     hashes completely differently - "PauI" (capital i) against "Paul", or
+     "N1na", "Mar1a", "Jam3s". Matching therefore runs on a skeleton, where
+     every character that renders like another is mapped to one canonical form.
+
+     This deliberately merges i and l, so "PauI" matches a "Paul" entry too.
+     That is the price of closing the spoof: the pair cannot be told apart
+     visually, so the blocklist does not try to. */
+
+  var CONFUSABLE = (function () {
+    var map = {};
+    function add(canon, chars) {
+      for (var i = 0; i < chars.length; i++) map[chars.charAt(i)] = canon;
+    }
+    // digits, punctuation and other scripts that render as latin letters
+    /* `i` is in here on purpose. Uppercase I lowercases to i, so by the time
+       matching runs there is nothing left to tell "PauI" from "Paui"; folding
+       the whole family together is what makes the spoof fail. */
+    add('l', 'i1|!ıℐⅼɩӀІіӏ');   // i 1 | ! dotless-i, cyrillic/greek i
+    add('o', '0οоσօ۰');                       // 0, greek/cyrillic/armenian o
+    add('e', '3еҽε℮');                             // 3, cyrillic/greek e
+    add('a', '4@аαӑ');                                  // 4 @, cyrillic/greek a
+    add('s', '5$ѕ');                                              // 5 $, cyrillic dze
+    add('t', '7тτ');
+    add('b', '8вβƃ');
+    add('g', '9ɡǥ');
+    add('z', '2ƶ');
+    add('c', 'сϲⅽ');                                    // cyrillic/greek c
+    add('p', 'рρ');
+    add('x', 'хχⅹ');
+    add('y', 'уγү');
+    add('k', 'кκK');
+    add('m', 'мμⅿ');
+    add('h', 'нһң');
+    add('n', 'ոᥒ');
+    add('u', 'υս');
+    add('d', 'ԁⅾ');
+    add('q', 'ԛգ');
+    add('w', 'ѡԝ');
+    add('r', 'гᴦ');
+    add('v', 'νⅴ');
+    add('j', 'јϳ');
+    add('f', 'ſ');
+    return map;
   })();
+
+  /* The matching form of a name: folded, then lookalikes canonicalised. */
+  function skeleton(s, caseSensitive) {
+    var f = fold(s, caseSensitive);
+    var out = '', i, ch;
+    for (i = 0; i < f.length; i++) {
+      ch = f.charAt(i);
+      out += CONFUSABLE[ch] || ch;
+    }
+    return out;
+  }
+
+  /* ---------------------------------------------------------- sha-256 --- */
+  /* Plain synchronous SHA-256. WebCrypto is async, and the name check runs
+     inside a React render, which cannot wait for a promise. */
+
+  var K = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+  ];
+
+  function rotr(x, n) { return (x >>> n) | (x << (32 - n)); }
+
+  function utf8(s) {
+    var out = [], i, c, c2, cp;
+    for (i = 0; i < s.length; i++) {
+      c = s.charCodeAt(i);
+      if (c < 0x80) out.push(c);
+      else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+      else if (c >= 0xd800 && c < 0xdc00 && i + 1 < s.length) {
+        c2 = s.charCodeAt(i + 1);
+        cp = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
+        i++;
+        out.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 63), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63));
+      } else out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+    }
+    return out;
+  }
+
+  function sha256(bytes) {
+    var H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+    var bits = bytes.length * 8;
+    var m = bytes.slice();
+    m.push(0x80);
+    while (m.length % 64 !== 56) m.push(0);
+    m.push(0, 0, 0, 0, (bits >>> 24) & 255, (bits >>> 16) & 255, (bits >>> 8) & 255, bits & 255);
+
+    var w = new Array(64), i, t, a, b, c, d, e, f, g, h, s0, s1, S0, S1, ch, maj, t1, t2;
+    for (i = 0; i < m.length; i += 64) {
+      for (t = 0; t < 16; t++) {
+        w[t] = (m[i + 4 * t] << 24) | (m[i + 4 * t + 1] << 16) | (m[i + 4 * t + 2] << 8) | m[i + 4 * t + 3];
+      }
+      for (t = 16; t < 64; t++) {
+        s0 = rotr(w[t - 15], 7) ^ rotr(w[t - 15], 18) ^ (w[t - 15] >>> 3);
+        s1 = rotr(w[t - 2], 17) ^ rotr(w[t - 2], 19) ^ (w[t - 2] >>> 10);
+        w[t] = (w[t - 16] + s0 + w[t - 7] + s1) | 0;
+      }
+      a = H[0]; b = H[1]; c = H[2]; d = H[3]; e = H[4]; f = H[5]; g = H[6]; h = H[7];
+      for (t = 0; t < 64; t++) {
+        S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+        ch = (e & f) ^ (~e & g);
+        t1 = (h + S1 + ch + K[t] + w[t]) | 0;
+        S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+        maj = (a & b) ^ (a & c) ^ (b & c);
+        t2 = (S0 + maj) | 0;
+        h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+      }
+      H[0] = (H[0] + a) | 0; H[1] = (H[1] + b) | 0; H[2] = (H[2] + c) | 0; H[3] = (H[3] + d) | 0;
+      H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;
+    }
+    var out = [];
+    for (i = 0; i < 8; i++) out.push((H[i] >>> 24) & 255, (H[i] >>> 16) & 255, (H[i] >>> 8) & 255, H[i] & 255);
+    return out;
+  }
+
+  function hex(bytes) {
+    var s = '';
+    for (var i = 0; i < bytes.length; i++) s += (bytes[i] < 16 ? '0' : '') + bytes[i].toString(16);
+    return s;
+  }
+
+  /* Typing re-hashes the same prefixes over and over, so memoise. Keyed by the
+     settings too, so editing the config from a console still behaves. */
+  var cache = Object.create(null);
+  var cacheN = 0;
+
+  function digest(value) {
+    var c = rawCfg();
+    var salt = str(c.salt);
+    var iter = typeof c.hashIterations === 'number' && c.hashIterations > 0 ? (c.hashIterations | 0) : 1;
+    var key = iter + '\u001f' + salt + '\u001f' + value;
+
+    if (cache[key] !== undefined) return cache[key];
+    var b = sha256(utf8(salt + '\u001f' + value));
+    for (var i = 1; i < iter; i++) b = sha256(b);
+    var out = hex(b);
+
+    if (cacheN >= MAX_CACHE) { cache = Object.create(null); cacheN = 0; }
+    cache[key] = out;
+    cacheN++;
+    return out;
+  }
+
+  /* --------------------------------------------------------- matching --- */
+
+  function defaultMatch() {
+    var c = cfg();
+    var m = str(c && c.match) || 'startsWith';
+    if (!MATCHERS[m]) {
+      warnOnce('match-' + m, 'access.config.js has unknown match "' + m + '" (expected startsWith, exact or contains); using startsWith');
+      return 'startsWith';
+    }
+    return m;
+  }
+
+  /* --- word matching, for names edited to dodge a prefix entry --- */
+  /* "Ada Lovelace" as a prefix misses "Ada Byron Lovelace". An allWords entry
+     instead requires every listed word to appear in the name with everything
+     that is not a letter stripped out first - so middle names, initials,
+     reordering, odd separators and no separator at all are all caught:
+       Ada Byron Lovelace / Ada B.Lovelace / Lovelace,Ada / AdaLovelace
+     while anyone sharing only one of the words is left alone.
+
+     `min` relaxes "every word" to "at least this many", which is what answers
+     a name part being cut down to an initial: list all three parts with min 2
+     and "A. Byron Lovelace" and "Ada B. Lovelace" both still match, yet
+     somebody who shares a single part does not. */
+
+  var HEX64 = /^[0-9a-f]{64}$/;
+
+  function trimEdges(w) {
+    try {
+      return w.replace(/^[^\p{L}\p{M}]+/u, '').replace(/[^\p{L}\p{M}]+$/u, '');
+    } catch (e) {
+      var cls = 'A-Za-zÀ-ɏͰ-ϿЀ-ӿ';
+      return w.replace(new RegExp('^[^' + cls + ']+'), '').replace(new RegExp('[^' + cls + ']+$'), '');
+    }
+  }
+
+  /* Words of an already-folded name. Punctuation is stripped from each edge, so
+     "Lovelace," matches "lovelace"; a hyphenated word yields the whole thing
+     and its parts, so "Jean-Luc" matches jean-luc, jean and luc. */
+  function wordsOf(subject) {
+    var raw = subject.split(' '), out = [], seen = Object.create(null), i, j, parts;
+
+    function add(w) { if (w && !seen['#' + w]) { seen['#' + w] = 1; out.push(w); } }
+
+    for (i = 0; i < raw.length; i++) {
+      var w = trimEdges(raw[i]);
+      add(w);
+      if (w.indexOf('-') !== -1) {
+        parts = w.split('-');
+        for (j = 0; j < parts.length; j++) add(trimEdges(parts[j]));
+      }
+    }
+    return out;
+  }
+
+  /* Everything that is not a letter or a mark, removed. Matching against this
+     is what makes the separator irrelevant: "Ada B.Lovelace", "Ada,Lovelace",
+     "Ada/Lovelace" and "AdaLovelace" all compact to the same letters, so none
+     of them can slip past an entry that the spaced form matches. */
+  function compact(s) {
+    try {
+      return s.replace(/[^\p{L}\p{M}]+/gu, '');
+    } catch (e) {
+      var cls = 'A-Za-zÀ-ɏͰ-ϿЀ-ӿ';
+      return s.replace(new RegExp('[^' + cls + ']+', 'g'), '');
+    }
+  }
+
+  /* Is `hash` the digest of any `len`-character window of `flat`? One digest
+     per window, and digests are memoised, so typing pays for each window once. */
+  function hasWindow(flat, hash, len) {
+    if (len <= 0 || len > flat.length) return false;
+    for (var s = 0; s + len <= flat.length; s++) {
+      if (digest(flat.substr(s, len)) === hash) return true;
+    }
+    return false;
+  }
+
+  /* How many of the entry's words must appear. Defaults to all of them; `min`
+     lowers the bar, so ['first','middle','last'] with min 2 still catches a
+     name that has dropped one part down to an initial. */
+  function wordsNeeded(entry, total) {
+    var min = entry.min;
+    if (typeof min !== 'number' || min < 1) return total;
+    return min > total ? total : (min | 0);
+  }
+
+  /* Counts how many of the entry's words appear in the compacted name, and
+     compares that against `min`. Each word is { hash, len }, or a plain word
+     while editing (readable, but handy). */
+  function hitWords(subject, entry, caseSensitive, idx) {
+    var list = entry.words;
+    if (!list.length) return false;
+    var flat = compact(subject);
+    if (!flat) return false;
+
+    var tokens = null;   // built only for a legacy hash that carries no len
+    var found = 0, usable = 0;
+
+    for (var i = 0; i < list.length; i++) {
+      var item = list[i], hash = '', len = -1, word = '', ok = false;
+
+      if (item && typeof item === 'object') {
+        hash = str(item.hash).toLowerCase();
+        if (typeof item.len === 'number' && item.len > 0) len = item.len | 0;
+        if (!hash) word = str(item.value);
+      } else {
+        var raw = str(item);
+        if (HEX64.test(raw.toLowerCase())) hash = raw.toLowerCase();
+        else word = raw;
+      }
+
+      if (word) {
+        var needle = compact(skeleton(word, caseSensitive));
+        if (!needle) continue;
+        usable++;
+        ok = flat.indexOf(needle) !== -1;
+      } else if (!hash) {
+        continue;
+      } else if (len > 0) {
+        usable++;
+        ok = hasWindow(flat, hash, len);
+      } else {
+        /* No len recorded: all we can do is compare whole words, which is what
+           this used to do and what "Ada B.Lovelace" defeats. */
+        warnOnce('words-nolen-' + idx, 'access.config.js blocklist entry #' + (idx + 1) + ' has a words[] hash with no len, so it can only be matched as a whole word and will miss names written without separators. Regenerate it with: node hash-name.mjs --words "First Last"');
+        usable++;
+        if (tokens === null) {
+          tokens = [];
+          var ws = wordsOf(subject);
+          for (var j = 0; j < ws.length; j++) tokens.push(digest(ws[j]));
+        }
+        ok = tokens.indexOf(hash) !== -1;
+      }
+
+      if (ok) found++;
+    }
+
+    return usable > 0 && found >= wordsNeeded(entry, usable);
+  }
+
+  /* --- surname + first initial, for a first name cut down to an initial --- */
+  /* A first-name entry misses "M. Lastname"; a words entry for "First Last"
+     misses it too, because "First" is gone. A surname entry pairs the surname
+     with the first letter of the given name instead, so these all match:
+       M. Last / Mike Last / Michael J. Last / M.Last / MLast / MichaelLast
+       Last, M. / Last, Michael
+     while "Last" alone, "Sam Last", and someone whose FIRST name is "Last"
+     ("Last Miller") are left alone. Only a token before the surname counts
+     as the given name, unless a comma right after a leading surname marks the
+     name as written surname-first.
+
+     Entry: { surname: { hash, len }, initial: { hash, len: 1 } } - from
+     `node hash-name.mjs --surname "First Last"`. */
+
+  function tokensOf(subject) {
+    try { return subject.split(/[^\p{L}\p{M}]+/u).filter(Boolean); }
+    catch (e) { return subject.split(/[^A-Za-zÀ-ɏͰ-ϿЀ-ӿ]+/).filter(Boolean); }
+  }
+
+  function hitSurname(subject, entry, idx) {
+    var sur = entry.surname, ini = entry.initial;
+    var sHash = str(sur && sur.hash).toLowerCase(), sLen = sur && typeof sur.len === 'number' ? sur.len | 0 : 0;
+    var iHash = str(ini && ini.hash).toLowerCase();
+    if (!sHash || sLen < 1 || !iHash) {
+      warnOnce('surname-' + idx, 'access.config.js blocklist entry #' + (idx + 1) + ' needs surname { hash, len } and initial { hash }; regenerate it with: node hash-name.mjs --surname "First Last". Entry skipped');
+      return false;
+    }
+
+    var t = tokensOf(subject), j, k, w;
+    var startsWithInitial = function (tok) { return !!tok && digest(tok.charAt(0)) === iHash; };
+
+    for (j = 0; j < t.length; j++) {
+      w = t[j];
+      if (w.length < sLen) continue;
+
+      // Glued onto the given name: "MLast", "MichaelLast".
+      if (w.length > sLen && digest(w.slice(-sLen)) === sHash && startsWithInitial(w)) return true;
+      // Glued after it, surname-first: "LastM".
+      if (w.length > sLen && digest(w.slice(0, sLen)) === sHash && startsWithInitial(w.slice(sLen))) return true;
+
+      if (w.length !== sLen || digest(w) !== sHash) continue;
+
+      // Surname as its own word: the given name comes before it...
+      for (k = 0; k < j; k++) if (startsWithInitial(t[k])) return true;
+
+      // ...or after it, but only when written "Last, First".
+      if (j === 0 && /^[^,\p{L}\p{M}]*,/u.test(subject.slice(subject.indexOf(w) + w.length))) {
+        for (k = 1; k < t.length; k++) if (startsWithInitial(t[k])) return true;
+      }
+    }
+    return false;
+  }
+
+  function hitPlain(subject, needle, mode) {
+    if (mode === 'exact') return subject === needle;
+    if (mode === 'contains') return subject.indexOf(needle) !== -1;
+    return subject.indexOf(needle) === 0;
+  }
+
+  /* `len` is the length of the hashed name. Recording it keeps this to one hash
+     per entry instead of one per prefix; without it we have to scan. */
+  function hitHash(subject, hash, len, mode, i) {
+    var s;
+    if (len > 0) {
+      if (len > subject.length) return false;
+      if (mode === 'exact') return len === subject.length && digest(subject) === hash;
+      if (mode === 'startsWith') return digest(subject.slice(0, len)) === hash;
+      for (s = 0; s + len <= subject.length; s++) if (digest(subject.substr(s, len)) === hash) return true;
+      return false;
+    }
+    if (mode === 'exact') return digest(subject) === hash;
+    if (mode === 'startsWith') {
+      for (s = 1; s <= subject.length; s++) if (digest(subject.slice(0, s)) === hash) return true;
+      return false;
+    }
+    warnOnce('hash-contains-' + i, 'access.config.js blocklist entry #' + (i + 1) + ' uses match "contains" with a hash but no len, so it cannot be checked; add len (hash-name.mjs prints it) or use startsWith. Entry skipped');
+    return false;
+  }
+
+  /* True when `name` is on the blacklist. Safe to call with anything. */
+  function isBlocked(name) {
+    var c = cfg();
+    if (!c) return false;
+
+    var caseSensitive = c.caseSensitive === true;
+    var subject = skeleton(name, caseSensitive);
+    if (!subject) return false;
+    if (subject.length > MAX_NAME) subject = subject.slice(0, MAX_NAME);
+
+    var list = Array.isArray(c.blocklist) ? c.blocklist : [];
+    var fallback = defaultMatch();
+
+    for (var i = 0; i < list.length; i++) {
+      var entry = list[i], mode = fallback, plain = '', hash = '', len = -1, m;
+
+      /* An entry carrying `words` is an allWords entry; order and anything
+         between the words is irrelevant. */
+      if (entry && typeof entry === 'object' && Array.isArray(entry.words)) {
+        if (hitWords(subject, entry, caseSensitive, i)) return true;
+        continue;
+      }
+
+      if (entry && typeof entry === 'object' && entry.surname) {
+        if (hitSurname(subject, entry, i)) return true;
+        continue;
+      }
+
+      if (entry && typeof entry === 'object') {
+        if (entry.match !== undefined) {
+          m = str(entry.match);
+          if (MATCHERS[m]) mode = m;
+          else warnOnce('emm-' + i, 'access.config.js blocklist entry #' + (i + 1) + ' has unknown match "' + m + '"; using ' + fallback);
+        }
+        if (str(entry.hash)) {
+          hash = str(entry.hash).toLowerCase();
+          if (typeof entry.len === 'number' && entry.len > 0) len = entry.len | 0;
+        } else {
+          plain = skeleton(entry.value, caseSensitive);
+        }
+      } else {
+        plain = skeleton(entry, caseSensitive);
+      }
+
+      if (hash) { if (hitHash(subject, hash, len, mode, i)) return true; }
+      else if (plain) { if (hitPlain(subject, plain, mode)) return true; }
+      else warnOnce('empty-' + i, 'access.config.js blocklist entry #' + (i + 1) + ' has neither value nor hash; skipped');
+    }
+    return false;
+  }
+
+  /* ------------------------------------------------------- name rule --- */
+  /* Rejects input that cannot be anybody's name: "\", "123", "a", "asdf!!".
+     Unenumerable, so it is a rule and not a blocklist entry. */
+
+  var NAME_PUNCT = " \\-'\u2019.,";   // space, hyphen, both apostrophes, dot, comma
+  var nameRe;                         // built once, lazily
+
+  function escapeClass(s) {
+    return String(s === undefined || s === null ? '' : s).replace(/[\\\]^-]/g, '\\$&');
+  }
+
+  function nameRegex() {
+    if (nameRe !== undefined) return nameRe;
+    var extra = escapeClass(nameCfg().extraChars);
+    try {
+      /* \p{L} letters, \p{M} combining marks - covers accents, and scripts
+         beyond Latin. Needs the u flag (ES2018). */
+      nameRe = new RegExp('^[\\p{L}\\p{M}' + NAME_PUNCT + extra + ']+$', 'u');
+    } catch (e) {
+      /* Engine without unicode property escapes: fall back to the common Latin
+         and Cyrillic/Greek ranges. Stricter than above, never looser. */
+      warnOnce('name-re', 'this browser lacks unicode property escapes in regexes; the name rule is using a narrower Latin/Greek/Cyrillic fallback');
+      nameRe = new RegExp('^[A-Za-z\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF' + NAME_PUNCT + extra + ']+$');
+    }
+    return nameRe;
+  }
+
+  function letterCount(s) {
+    var re;
+    try { re = /[\p{L}]/gu; } catch (e) { re = /[A-Za-z\u00C0-\u024F\u0370-\u03FF\u0400-\u04FF]/g; }
+    var m = s.match(re);
+    return m ? m.length : 0;
+  }
+
+  function nameCfg() {
+    var c = cfg();
+    var n = c && c.nameRules && typeof c.nameRules === 'object' ? c.nameRules : null;
+    return n || {};
+  }
+
+  /* True when the name cannot be a person's name. Empty is governed by
+     allowEmpty, so a half-filled profile can be treated either way. */
+  function implausibleName(name) {
+    var n = nameCfg();
+    if (!cfg() || n.enabled === false) return false;
+
+    var v = fold(name, true);                 // case is irrelevant to shape
+    if (!v) return n.allowEmpty === true ? false : true;
+
+    var min = typeof n.minLetters === 'number' && n.minLetters >= 0 ? n.minLetters : 2;
+    if (letterCount(v) < min) return true;
+    return !nameRegex().test(v);
+  }
+
+  /* --------------------------------------------------- webhook rule --- */
+  /* `requireWebhook` makes the Profile > Integrations > Webhook dropdown a
+     precondition: until it points at an endpoint that webhook.config.js still
+     lists, the profile is treated exactly like a blocked one. */
+
+  function webhookOptions() {
+    try {
+      var o = window.RTWebhookOptions && window.RTWebhookOptions();
+      return Array.isArray(o) ? o : [];
+    } catch (e) { return []; }
+  }
+
+  function requiresWebhook() {
+    var c = cfg();
+    if (!c || c.requireWebhook !== true) return false;
+    /* No endpoints to pick from means no profile could ever satisfy the rule,
+       which would lock everyone out of the app. Refuse to enforce it. */
+    if (webhookOptions().length === 0) {
+      warnOnce('rw-empty', 'access.config.js sets requireWebhook: true, but webhook.config.js offers no usable endpoint, so no profile could ever satisfy it. The requirement is ignored until at least one endpoint exists.');
+      return false;
+    }
+    return true;
+  }
+
+  function hasWebhook(id) {
+    id = str(id);
+    if (!id) return false;
+    var o = webhookOptions();
+    for (var i = 0; i < o.length; i++) if (o[i] && o[i].id === id) return true;
+    return false;   // selected, but no longer listed in webhook.config.js
+  }
+
+  /* 'blocklist', 'name', 'webhook', or null when the profile is fine. */
+  function reasonFor(p) {
+    if (!cfg()) return null;
+    if (isBlocked(p.name)) return 'blocklist';
+    if (implausibleName(p.name)) return 'name';
+    if (requiresWebhook() && !hasWebhook(p.webhookId)) return 'webhook';
+    return null;
+  }
+
+  /* --------------------------------------------------------- the tabs --- */
+
+  function configuredTabs() {
+    var c = cfg();
+    var list = c && Array.isArray(c.blockedTabs) ? c.blockedTabs : ['preview'];
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      var id = str(list[i]);
+      if (!id) continue;
+      if (!TABS[id]) { warnOnce('tab-' + id, 'access.config.js blockedTabs has unknown tab "' + id + '" (expected ' + Object.keys(TABS).join(', ') + '); ignored'); continue; }
+      if (out.indexOf(id) === -1) out.push(id);
+    }
+    return out;
+  }
+
+  function fallbackTab() {
+    var c = cfg();
+    var id = str(c && c.fallbackTab) || 'home';
+    return TABS[id] ? id : 'home';
+  }
+
+  /* `reason` defaults to why the current profile is blocked. */
+  function message(reason) {
+    var c = cfg() || {};
+    var m = c.messages && typeof c.messages === 'object' ? c.messages : {};
+    var why = reason === undefined ? currentReason : reason;
+    return str(m[why]) || str(c.message) || 'This profile does not have access to this tab.';
+  }
+
+  function tabsFor(p) {
+    return reasonFor(p) ? configuredTabs() : [];
+  }
+
+  function same(a, b) {
+    if (a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+
+  /* Recompute from `currentName`; announce only when the answer moved. The name
+     is deliberately kept out of the log line and the event detail. */
+  function refresh() {
+    var why = reasonFor(currentProfile);
+    var next = why ? configuredTabs() : [];
+    if (same(next, currentTabs) && why === currentReason) return currentTabs;
+
+    var was = currentTabs;
+    currentTabs = next;
+    currentReason = why;
+
+    if (next.length) log(LOG_PREFIX, 'this profile is blocked from: ' + next.join(', ') + ' (' + why + ')');
+    else if (was.length) log(LOG_PREFIX, 'this profile is no longer blocked');
+
+    try {
+      document.documentElement.dispatchEvent(new CustomEvent(EVENT, {
+        bubbles: true,
+        detail: { blockedTabs: next.slice(), reason: why }
+      }));
+    } catch (e) { /* very old browser - the app still reads blockedTabs() on mount */ }
+
+    return currentTabs;
+  }
+
+  function setProfile(profile) {
+    currentProfile = profile && typeof profile === 'object'
+      ? { name: str(profile.fullName), webhookId: str(profile.webhookId) }
+      : { name: str(profile), webhookId: '' };
+    return refresh();
+  }
+
+  /* Seed from whatever was saved last session, so a blocked profile is blocked
+     on the very first render rather than after the first keystroke. */
+  function boot() {
+    try {
+      var raw = localStorage.getItem(PROFILE_KEY);
+      if (raw) {
+        var saved = JSON.parse(raw);
+        currentProfile = { name: str(saved.fullName), webhookId: str(saved.webhookId) };
+      }
+    } catch (e) { /* no storage, or not JSON - treat as no profile */ }
+    currentReason = reasonFor(currentProfile);
+    currentTabs = currentReason ? configuredTabs() : [];
+    if (currentTabs.length) log(LOG_PREFIX, 'this profile is blocked from: ' + currentTabs.join(', ') + ' (' + currentReason + ')');
+  }
+
+  boot();
+
+  var API = {
+    setProfile: setProfile,
+    blockedTabs: function () { return currentTabs.slice(); },
+    isBlockedTab: function (id) { return currentTabs.indexOf(str(id)) !== -1; },
+    isBlocked: isBlocked,
+    fallbackTab: fallbackTab,
+    message: message,
+    refresh: refresh,
+    event: EVENT,
+    /* Why the current profile is blocked: 'blocklist', 'name', 'webhook', null. */
+    reason: function () { return currentReason; },
+    /* Does this text fail the "could be a person's name" rule? Used by the
+       Profile tab to explain itself; blank counts only when allowEmpty is off. */
+    implausibleName: implausibleName,
+    /* Is a webhook currently a precondition for generating? False when the rule
+       is off, or when webhook.config.js lists nothing to pick. */
+    requiresWebhook: requiresWebhook,
+    /* Does the current profile point at an endpoint that still exists? */
+    hasWebhook: function () { return hasWebhook(currentProfile.webhookId); },
+    /* Turn a name into the { hash, len } pair that goes in the config. Uses the
+       salt / hashIterations / caseSensitive currently loaded, so every entry has
+       to be regenerated if you change any of those. */
+    hash: function (name) {
+      var v = skeleton(name, rawCfg().caseSensitive === true);
+      return { hash: digest(v), len: v.length };
+    }
+  };
+
+  /* Non-writable so `RTAccess = {blockedTabs:()=>[]}` typed into a console does
+     not swap the guard out. Anyone who can edit the bundle still can, of course.
+     The fallback covers a browser that refuses defineProperty, and the inner
+     catch covers this file somehow running twice. */
+  try {
+    Object.defineProperty(window, 'RTAccess', {
+      value: API, writable: false, configurable: false, enumerable: true
+    });
+  } catch (e) {
+    try { window.RTAccess = API; } catch (e2) { /* already locked - fine */ }
+  }
+})();
 
 })();/*RT_ACCESS_EMBED_END*/
 
